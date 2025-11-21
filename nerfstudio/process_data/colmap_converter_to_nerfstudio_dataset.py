@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Literal, Optional, Tuple
 
-from nerfstudio.process_data import colmap_utils, hloc_utils, process_data_utils
+from nerfstudio.process_data import colmap_utils, hloc_utils, process_data_utils, vggt_utils
 from nerfstudio.process_data.base_converter_to_nerfstudio_dataset import BaseConverterToNerfstudioDataset
 from nerfstudio.process_data.process_data_utils import CAMERA_MODELS
 from nerfstudio.utils import install_checks
@@ -35,9 +35,10 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     """Feature matching method to use. Vocab tree is recommended for a balance of speed
     and accuracy. Exhaustive is slower but more accurate. Sequential is faster but
     should only be used for videos."""
-    sfm_tool: Literal["any", "colmap", "hloc"] = "any"
+    sfm_tool: Literal["any", "colmap", "hloc", "vggt"] = "any"
     """Structure from motion tool to use. Colmap will use sift features, hloc can use
-    many modern methods such as superpoint features and superglue matcher"""
+    many modern methods such as superpoint features and superglue matcher, vggt uses
+    deep learning-based pose and depth estimation"""
     refine_pixsfm: bool = False
     """If True, runs refinement using Pixel Perfect SFM.
     Only works with hloc sfm_tool"""
@@ -237,6 +238,16 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 matcher_type=matcher_type,
                 refine_pixsfm=self.refine_pixsfm,
                 use_single_camera_mode=self.use_single_camera_mode,
+            )
+        elif sfm_tool == "vggt":
+            if mask_path is not None:
+                raise RuntimeError("Cannot use a mask with vggt. Please remove the cropping options and try again.")
+
+            vggt_utils.run_vggt(
+                image_dir=image_dir,
+                colmap_dir=self.absolute_colmap_path,
+                camera_model=CAMERA_MODELS[self.camera_type],
+                verbose=self.verbose,
             )
         else:
             raise RuntimeError("Invalid combination of sfm_tool, feature_type, and matcher_type, exiting")

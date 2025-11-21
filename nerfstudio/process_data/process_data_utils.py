@@ -490,7 +490,7 @@ def downscale_images(
 
 
 def find_tool_feature_matcher_combination(
-    sfm_tool: Literal["any", "colmap", "hloc"],
+    sfm_tool: Literal["any", "colmap", "hloc", "vggt"],
     feature_type: Literal[
         "any",
         "sift",
@@ -518,7 +518,7 @@ def find_tool_feature_matcher_combination(
 ) -> Union[
     Tuple[None, None, None],
     Tuple[
-        Literal["colmap", "hloc"],
+        Literal["colmap", "hloc", "vggt"],
         Literal[
             "sift",
             "superpoint_aachen",
@@ -546,7 +546,7 @@ def find_tool_feature_matcher_combination(
     Basically, replace the default parameters 'any' by usable value
 
     Args:
-        sfm_tool: Sfm tool name (any, colmap, hloc)
+        sfm_tool: Sfm tool name (any, colmap, hloc, vggt)
         feature_type: Type of image features (any, sift, superpoint, ...)
         matcher_type: Type of matching algorithm (any, NN, superglue,...)
 
@@ -554,6 +554,10 @@ def find_tool_feature_matcher_combination(
         Tuple of sfm tool, feature type, and matcher type.
         Returns (None,None,None) if no valid combination can be found
     """
+    # VGGT does not require feature_type or matcher_type
+    if sfm_tool == "vggt":
+        return ("vggt", None, None)
+
     if sfm_tool == "any":
         if (feature_type in ("any", "sift")) and (matcher_type in ("any", "NN")):
             sfm_tool = "colmap"
