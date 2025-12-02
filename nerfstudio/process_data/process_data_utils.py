@@ -556,6 +556,10 @@ def find_tool_feature_matcher_combination(
     """
     # VGGT does not require feature_type or matcher_type
     if sfm_tool == "vggt":
+        # Check if vggt is available
+        from nerfstudio.process_data import vggt_utils
+        if not vggt_utils.is_vggt_available():
+            return (None, None, None)
         return ("vggt", None, None)
 
     if sfm_tool == "any":

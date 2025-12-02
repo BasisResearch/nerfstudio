@@ -69,7 +69,7 @@ dependencies = [
     "pathos",
     "packaging",
     "fpsample",
-    "tensorly"
+    "tensorly",
 ]
 
 [project.urls]

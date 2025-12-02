@@ -45,6 +45,11 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     refine_intrinsics: bool = True
     """If True, do bundle adjustment to refine intrinsics.
     Only works with colmap sfm_tool"""
+    refine_vggt_ba: bool = False
+    """If True, use feature-based tracking (VGGSfM) and bundle adjustment with VGGT.
+    This follows the official VGGT demo approach using predict_tracks() and
+    batch_np_matrix_to_pycolmap(). If False, uses simpler depth-based reconstruction.
+    Only works with vggt sfm_tool. Requires pycolmap and VGGT dependencies."""
     feature_type: Literal[
         "any",
         "sift",
@@ -195,6 +200,17 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
         ) = process_data_utils.find_tool_feature_matcher_combination(
             self.sfm_tool, self.feature_type, self.matcher_type
         )
+
+        # Check if tool is not available
+        if sfm_tool is None:
+            if self.sfm_tool == "vggt":
+                raise RuntimeError(
+                    "VGGT is not installed. Please install VGGT from https://github.com/facebookresearch/vggt "
+                    "or use a different sfm_tool (colmap or hloc)."
+                )
+            else:
+                raise RuntimeError("Invalid combination of sfm_tool, feature_type, and matcher_type")
+
         # check that sfm_tool is hloc if using refine_pixsfm
         if self.refine_pixsfm:
             assert sfm_tool == "hloc", "refine_pixsfm only works with sfm_tool hloc"
@@ -243,12 +259,22 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
             if mask_path is not None:
                 raise RuntimeError("Cannot use a mask with vggt. Please remove the cropping options and try again.")
 
-            vggt_utils.run_vggt(
-                image_dir=image_dir,
-                colmap_dir=self.absolute_colmap_path,
-                camera_model=CAMERA_MODELS[self.camera_type],
-                verbose=self.verbose,
-            )
+            if self.refine_vggt_ba:
+                # Use official VGGT approach with feature-based tracking and bundle adjustment
+                vggt_utils.run_vggt_ba(
+                    image_dir=image_dir,
+                    colmap_dir=self.absolute_colmap_path,
+                    camera_model=CAMERA_MODELS[self.camera_type],
+                    verbose=True, #self.verbose,
+                )
+            else:
+                # Use simpler depth-based reconstruction without bundle adjustment
+                vggt_utils.run_vggt(
+                    image_dir=image_dir,
+                    colmap_dir=self.absolute_colmap_path,
+                    camera_model=CAMERA_MODELS[self.camera_type],
+                    verbose=self.verbose,
+                )
         else:
             raise RuntimeError("Invalid combination of sfm_tool, feature_type, and matcher_type, exiting")
 
