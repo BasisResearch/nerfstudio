@@ -53,10 +53,15 @@ import pycolmap
 # Try to import vggt - it's an optional dependency
 try:
     from vggt.dependency.track_predict import predict_tracks
+    from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
+    from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap_wo_track
     _HAS_VGGT = True
 except ImportError:
     _HAS_VGGT = False
     predict_tracks = None  # type: ignore
+    create_pixel_coordinate_grid = None  # type: ignore
+    randomly_limit_trues = None  # type: ignore
+    batch_np_matrix_to_pycolmap_wo_track = None  # type: ignore
 
 from nerfstudio.process_data.process_data_utils import CameraModel
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -82,11 +87,12 @@ def run_vggt(
     mask_white_bg: bool = False,
     stride: int = 1,
     model_name: str = "facebook/VGGT-1B",
+    shared_camera: bool = True,
 ) -> None:
-    """Runs VGGT on images to estimate camera poses and depth (jckhng's approach).
+    """Runs VGGT on images to estimate camera poses and depth (Facebook's feedforward mode).
 
-    This is the simple, direct approach: VGGT inference → depth unprojection → COLMAP.
-    No bundle adjustment is performed.
+    This follows Facebook's demo_colmap.py without bundle adjustment:
+    VGGT inference → depth unprojection → filter points → batch_np_matrix_to_pycolmap_wo_track()
 
     Args:
         image_dir: Path to the directory containing the images.
@@ -99,6 +105,7 @@ def run_vggt(
         mask_white_bg: If True, filter out points with very bright/white color.
         stride: Stride for point sampling (higher = fewer points).
         model_name: HuggingFace model name for VGGT.
+        shared_camera: If True, use single camera model for all frames.
     """
     if not _HAS_VGGT:
         CONSOLE.print(
@@ -120,42 +127,82 @@ def run_vggt(
 
     # Extract data from inference results
     extrinsic = vggt_data["extrinsic"]
-    intrinsic = vggt_data["intrinsic"]
+    intrinsic_downsampled = vggt_data["intrinsic_downsampled"]
     world_points = vggt_data["world_points"]
     colors_rgb = vggt_data["colors_rgb"]
     depth_conf = vggt_data["depth_conf"]
     image_paths = vggt_data["image_paths"]
     original_width = vggt_data["original_width"]
     original_height = vggt_data["original_height"]
+    model_resolution = vggt_data["model_resolution"]
 
-    # Convert camera poses to COLMAP format
-    quaternions, translations = _extrinsic_to_colmap_format(extrinsic)
+    # Filter and prepare 3D points in Facebook's format (points3d, points_xyf, points_rgb)
+    # Note: Facebook uses conf_threshold as a value (e.g., 5.0), not percentile
+    # For compatibility, we convert percentile to value if > 1
+    if conf_threshold > 1.0:
+        # Interpret as percentile and convert to value
+        conf_threshold_value = np.percentile(depth_conf, conf_threshold)
+    else:
+        # Interpret as value directly
+        conf_threshold_value = conf_threshold
 
-    # Filter and prepare 3D points
-    points3D, image_points2D = _filter_and_prepare_points(
+    if verbose:
+        CONSOLE.print(f"  - Using confidence threshold: {conf_threshold_value:.4f}")
+
+    points3d, points_xyf, points_rgb = _filter_and_prepare_points_for_pycolmap(
         world_points=world_points,
         world_points_conf=depth_conf,
         colors_rgb=colors_rgb,
-        conf_threshold=conf_threshold,
+        conf_threshold=conf_threshold_value,
         stride=stride,
         mask_black_bg=mask_black_bg,
         mask_white_bg=mask_white_bg,
         verbose=verbose,
     )
 
-    # Write COLMAP files (binary format)
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Building pycolmap reconstruction at {model_resolution}x{model_resolution}...")
+
+    # Step 1: Build reconstruction at model resolution (518x518) using intrinsic_downsampled
+    reconstruction = _build_pycolmap_reconstruction_without_tracks(
+        points3d=points3d,
+        points_xyf=points_xyf,
+        points_rgb=points_rgb,
+        extrinsic=extrinsic,
+        intrinsic=intrinsic_downsampled,
+        image_paths=image_paths,
+        image_size=(model_resolution, model_resolution),
+        shared_camera=shared_camera,
+        camera_type="SIMPLE_PINHOLE",
+        verbose=verbose,
+    )
+
+    if reconstruction is None:
+        CONSOLE.print("[bold red]Error: Failed to build pycolmap reconstruction!")
+        sys.exit(1)
+
+    # Step 2: Rescale reconstruction to original dimensions
+    original_image_sizes = [(original_width, original_height)] * len(image_paths)
+    reconstruction = _rescale_reconstruction_to_original_dimensions(
+        reconstruction=reconstruction,
+        image_paths=image_paths,
+        original_image_sizes=original_image_sizes,
+        model_resolution=model_resolution,
+        shared_camera=shared_camera,
+        verbose=verbose,
+    )
+
+    # Write reconstruction to binary format
     if verbose:
         CONSOLE.print(f"[bold yellow]Writing COLMAP files to {output_dir}")
 
-    _write_colmap_cameras_bin(output_dir / "cameras.bin", intrinsic, original_width, original_height)
-    _write_colmap_images_bin(output_dir / "images.bin", quaternions, translations, image_points2D, image_paths)
-    _write_colmap_points3D_bin(output_dir / "points3D.bin", points3D)
+    reconstruction.write_binary(str(output_dir))
 
     if verbose:
         CONSOLE.print(f"[bold green]✓ COLMAP reconstruction complete!")
-        CONSOLE.print(f"  - Cameras: {len(intrinsic)}")
-        CONSOLE.print(f"  - Images: {len(quaternions)}")
-        CONSOLE.print(f"  - 3D points: {len(points3D)}")
+        CONSOLE.print(f"  - Cameras: {len(reconstruction.cameras)}")
+        CONSOLE.print(f"  - Images: {len(reconstruction.images)}")
+        CONSOLE.print(f"  - 3D points: {len(reconstruction.points3D)}")
 
 
 def run_vggt_ba(
@@ -176,6 +223,7 @@ def run_vggt_ba(
     max_query_pts: int = 2048,
     query_frame_num: int = 5,
     keypoint_extractor: str = "aliked+sp",
+    max_points_num: int = 2048,
     fine_tracking: bool = True,
     vis_thresh: float = 0.5,
     max_reproj_error: Optional[float] = None,
@@ -295,6 +343,7 @@ def run_vggt_ba(
         CONSOLE.print(f"  - max_query_pts: {max_query_pts}")
         CONSOLE.print(f"  - query_frame_num: {query_frame_num}")
         CONSOLE.print(f"  - fine_tracking: {fine_tracking}")
+        CONSOLE.print(f"  - max_points_num: {max_points_num}")
 
         # Warn about memory usage if using high settings
         if fine_tracking or max_query_pts > 1024 or query_frame_num > 3:
@@ -323,6 +372,7 @@ def run_vggt_ba(
         max_query_pts=max_query_pts,
         query_frame_num=query_frame_num,
         keypoint_extractor=keypoint_extractor,
+        max_points_num=max_points_num,
         fine_tracking=fine_tracking,
     )
 
@@ -388,40 +438,28 @@ def run_vggt_ba(
     if verbose:
         CONSOLE.print(f"[bold green]✓ Bundle adjustment complete")
 
-    # Extract refined data from reconstruction
-    refined_quaternions, refined_translations, refined_intrinsics, refined_points3D, refined_image_points2D = \
-        _extract_from_pycolmap_reconstruction(reconstruction, image_paths)
+    # Rescale reconstruction from track_resolution to original dimensions
+    original_image_sizes = [(original_width, original_height)] * len(image_paths)
+    reconstruction = _rescale_reconstruction_to_original_dimensions(
+        reconstruction=reconstruction,
+        image_paths=image_paths,
+        original_image_sizes=original_image_sizes,
+        model_resolution=track_resolution,
+        shared_camera=shared_camera,
+        verbose=verbose,
+    )
 
-    # Rescale intrinsics and 2D points from track_resolution to original resolution
-    scale_x = original_width / track_resolution
-    scale_y = original_height / track_resolution
-
-    for i in range(len(refined_intrinsics)):
-        refined_intrinsics[i][0, 0] *= scale_x  # fx
-        refined_intrinsics[i][1, 1] *= scale_y  # fy
-        refined_intrinsics[i][0, 2] *= scale_x  # cx
-        refined_intrinsics[i][1, 2] *= scale_y  # cy
-
-    # Rescale 2D points
-    for i in range(len(refined_image_points2D)):
-        for j in range(len(refined_image_points2D[i])):
-            x, y, point3d_id = refined_image_points2D[i][j]
-            refined_image_points2D[i][j] = (x * scale_x, y * scale_y, point3d_id)
-
-    # Write COLMAP files (binary format) with refined results
+    # Write refined COLMAP files
     if verbose:
         CONSOLE.print(f"[bold yellow]Writing refined COLMAP files to {output_dir}")
 
-    _write_colmap_cameras_bin(output_dir / "cameras.bin", refined_intrinsics, original_width, original_height)
-    _write_colmap_images_bin(output_dir / "images.bin", refined_quaternions, refined_translations,
-                             refined_image_points2D, image_paths)
-    _write_colmap_points3D_bin(output_dir / "points3D.bin", refined_points3D)
+    reconstruction.write_binary(str(output_dir))
 
     if verbose:
         CONSOLE.print(f"[bold green]✓ COLMAP reconstruction with BA complete!")
-        CONSOLE.print(f"  - Cameras: {len(refined_intrinsics)}")
-        CONSOLE.print(f"  - Images: {len(refined_quaternions)}")
-        CONSOLE.print(f"  - 3D points: {len(refined_points3D)}")
+        CONSOLE.print(f"  - Cameras: {len(reconstruction.cameras)}")
+        CONSOLE.print(f"  - Images: {len(reconstruction.images)}")
+        CONSOLE.print(f"  - 3D points: {len(reconstruction.points3D)}")
 
 
 # ============================================================================
@@ -608,148 +646,22 @@ def _run_vggt_inference(
     # Get depth confidence
     depth_conf = predictions.get("depth_conf", np.ones_like(depth_map[..., 0]))
 
+    # Determine model resolution from world_points shape
+    model_resolution = world_points.shape[1]  # H dimension (should be 518)
+
     return {
         "extrinsic": extrinsic,
         "intrinsic": intrinsic,
+        "intrinsic_downsampled": intrinsic_downsampled,
         "world_points": world_points,
         "colors_rgb": colors_rgb,
         "depth_conf": depth_conf,
         "image_paths": image_paths,
         "original_width": original_width,
         "original_height": original_height,
+        "model_resolution": model_resolution,
     }
 
-
-def _build_pycolmap_reconstruction(
-    points3D: List[Dict],
-    image_points2D: List[List],
-    extrinsic: np.ndarray,
-    intrinsic: np.ndarray,
-    image_paths: List[Path],
-    image_size: Tuple[int, int],
-    shared_camera: bool,
-    verbose: bool,
-):
-    """Build a pycolmap Reconstruction from depth-based tracks.
-
-    This follows the pattern from Facebook's batch_np_matrix_to_pycolmap function.
-
-    Args:
-        points3D: List of 3D point dictionaries with tracks
-        image_points2D: List of 2D points per image
-        extrinsic: Camera extrinsic matrices (N, 4, 4)
-        intrinsic: Camera intrinsic matrices (N, 3, 3)
-        image_paths: Paths to images
-        image_size: (width, height) tuple
-        shared_camera: If True, use single camera model for all frames
-        verbose: If True, log progress
-
-    Returns:
-        pycolmap.Reconstruction object or None if failed
-    """
-    try:
-        import pycolmap
-    except ImportError:
-        return None
-
-    reconstruction = pycolmap.Reconstruction()
-    width, height = image_size
-
-    # Add cameras
-    if shared_camera:
-        # Use single camera for all images (like Facebook demo)
-        # Average the intrinsics
-        mean_intrinsic = np.mean(intrinsic, axis=0)
-        fx = float(mean_intrinsic[0, 0])
-        fy = float(mean_intrinsic[1, 1])
-        cx = float(mean_intrinsic[0, 2])
-        cy = float(mean_intrinsic[1, 2])
-
-        camera = pycolmap.Camera(
-            model="SIMPLE_PINHOLE",
-            width=width,
-            height=height,
-            params=[fx, cx, cy],  # SIMPLE_PINHOLE uses average of fx/fy
-        )
-        camera.camera_id = 1
-        reconstruction.add_camera(camera)
-        camera_ids = [1] * len(image_paths)
-    else:
-        # Create separate camera for each image
-        camera_ids = []
-        for i, K in enumerate(intrinsic):
-            fx = float(K[0, 0])
-            fy = float(K[1, 1])
-            cx = float(K[0, 2])
-            cy = float(K[1, 2])
-
-            camera = pycolmap.Camera(
-                model="PINHOLE",
-                width=width,
-                height=height,
-                params=[fx, fy, cx, cy],
-            )
-            camera.camera_id = i + 1
-            reconstruction.add_camera(camera)
-            camera_ids.append(i + 1)
-
-    # Convert extrinsics to quaternion + translation
-    quaternions, translations = _extrinsic_to_colmap_format(extrinsic)
-
-    # Add images
-    for i, img_path in enumerate(image_paths):
-        qvec = quaternions[i].astype(float)
-        tvec = translations[i].astype(float)
-
-        image = pycolmap.Image(
-            id=i + 1,
-            name=img_path.name,
-            camera_id=camera_ids[i],
-            qvec=qvec,
-            tvec=tvec,
-        )
-        reconstruction.add_image(image)
-
-    # Add 3D points with tracks
-    for point in points3D:
-        point_id = point["id"] + 1
-        xyz = point["xyz"].astype(float)
-        rgb = point["rgb"].astype(np.uint8)
-        track = point["track"]
-
-        # Create pycolmap track
-        pycolmap_track = pycolmap.Track()
-        for img_idx, point2d_idx in track:
-            pycolmap_track.add_element(img_idx + 1, point2d_idx)
-
-        # Add point3D to reconstruction
-        point3d = reconstruction.add_point3D(
-            xyz=xyz,
-            track=pycolmap_track,
-            color=rgb,
-        )
-
-    # Register 2D points with images
-    for img_idx, points_2d in enumerate(image_points2D):
-        image = reconstruction.images[img_idx + 1]
-        points2D = []
-
-        for x, y, point3d_id in points_2d:
-            point2d = pycolmap.Point2D()
-            point2d.xy = np.array([float(x), float(y)])
-            point2d.point3D_id = point3d_id + 1
-            points2D.append(point2d)
-
-        image.points2D = points2D
-        image.registered = True
-
-    if verbose:
-        CONSOLE.print(f"  - Created reconstruction:")
-        CONSOLE.print(f"    - Cameras: {len(reconstruction.cameras)}")
-        CONSOLE.print(f"    - Images: {len(reconstruction.images)}")
-        CONSOLE.print(f"    - Points3D: {len(reconstruction.points3D)}")
-
-    return reconstruction
 
 
 def _build_pycolmap_reconstruction_from_tracks(
@@ -849,95 +761,6 @@ def _build_pycolmap_reconstruction_from_tracks(
         CONSOLE.print(f"    - Valid tracks: {np.sum(valid_mask)}/{len(valid_mask)}")
 
     return reconstruction
-
-
-def _extract_from_pycolmap_reconstruction(
-    reconstruction,
-    image_paths: List[Path],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict], List[List]]:
-    """Extract refined data from pycolmap Reconstruction after bundle adjustment.
-
-    Returns:
-        quaternions: (N, 4) array of quaternions
-        translations: (N, 3) array of translations
-        intrinsics: (N, 3, 3) array of intrinsic matrices
-        points3D: List of 3D point dictionaries
-        image_points2D: List of 2D points per image
-    """
-    import pycolmap
-
-    num_images = len(image_paths)
-
-    # Extract camera poses
-    quaternions = []
-    translations = []
-    for i, img_path in enumerate(image_paths):
-        image = reconstruction.images[i + 1]
-        quaternions.append(image.qvec)
-        translations.append(image.tvec)
-
-    quaternions = np.array(quaternions)
-    translations = np.array(translations)
-
-    # Extract intrinsics
-    intrinsics = []
-    for i in range(num_images):
-        image = reconstruction.images[i + 1]
-        camera = reconstruction.cameras[image.camera_id]
-
-        # Build intrinsic matrix from camera params
-        if camera.model_name == "SIMPLE_PINHOLE":
-            f, cx, cy = camera.params
-            K = np.array([
-                [f, 0, cx],
-                [0, f, cy],
-                [0, 0, 1]
-            ])
-        elif camera.model_name == "PINHOLE":
-            fx, fy, cx, cy = camera.params
-            K = np.array([
-                [fx, 0, cx],
-                [0, fy, cy],
-                [0, 0, 1]
-            ])
-        else:
-            # Default to identity
-            K = np.eye(3)
-
-        intrinsics.append(K)
-
-    intrinsics = np.array(intrinsics)
-
-    # Extract 3D points
-    points3D = []
-    for point3d_id, point3d in reconstruction.points3D.items():
-        track = []
-        for element in point3d.track.elements:
-            track.append((element.image_id - 1, element.point2D_idx))
-
-        points3D.append({
-            "id": point3d_id - 1,
-            "xyz": point3d.xyz,
-            "rgb": point3d.color,
-            "error": point3d.error,
-            "track": track,
-        })
-
-    # Extract 2D points per image
-    image_points2D = []
-    for i in range(num_images):
-        image = reconstruction.images[i + 1]
-        points_2d = []
-
-        for point_idx, point2d in enumerate(image.points2D):
-            if point2d.point3D_id != pycolmap.kInvalidPoint3DId:
-                x, y = point2d.xy
-                point3d_id = point2d.point3D_id - 1
-                points_2d.append((x, y, point3d_id))
-
-        image_points2D.append(points_2d)
-
-    return quaternions, translations, intrinsics, points3D, image_points2D
 
 
 def _load_images_for_tracking(
@@ -1122,36 +945,159 @@ def refine_vggt_with_ba(
         CONSOLE.print(f"  - Refined reconstruction written to {sparse_dir}")
 
 
-def _extrinsic_to_colmap_format(extrinsics: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Convert extrinsic matrices to COLMAP format (quaternion + translation).
+# ============================================================================
+# FACEBOOK VGGT HELPER FUNCTIONS
+# These functions are sourced from Facebook's VGGT repository to match their
+# exact post-model workflow for COLMAP reconstruction.
+# ============================================================================
+
+def _build_pycolmap_reconstruction_without_tracks(
+    points3d: np.ndarray,
+    points_xyf: np.ndarray,
+    points_rgb: np.ndarray,
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    image_paths: List[Path],
+    image_size: Tuple[int, int],
+    shared_camera: bool,
+    camera_type: str,
+    verbose: bool,
+) -> Optional[Any]:
+    """Build pycolmap reconstruction without tracks using Facebook's function.
+
+    This is a thin wrapper around Facebook's batch_np_matrix_to_pycolmap_wo_track function.
 
     Args:
-        extrinsics: Camera extrinsic matrices (N, 4, 4) or (N, 3, 4)
+        points3d: 3D points (P, 3)
+        points_xyf: 2D points with frame indices (P, 3) - [x, y, frame_idx]
+        points_rgb: RGB colors (P, 3)
+        extrinsic: Camera extrinsics (N, 4, 4)
+        intrinsic: Camera intrinsics (N, 3, 3)
+        image_paths: Paths to images
+        image_size: (width, height) of images
+        shared_camera: Whether to use a single shared camera
+        camera_type: Camera model type (e.g., "SIMPLE_PINHOLE")
+        verbose: Whether to print progress
 
     Returns:
-        Tuple of:
-        - quaternions: (N, 4) array in COLMAP format [w, x, y, z]
-        - translations: (N, 3) array of camera positions
+        pycolmap Reconstruction object, or None if failed
     """
-    num_cameras = extrinsics.shape[0]
-    quaternions = []
-    translations = []
+    # Convert extrinsic from (N, 4, 4) to (N, 3, 4) if needed
+    if extrinsic.shape[1] == 4:
+        extrinsic_3x4 = extrinsic[:, :3, :]
+    else:
+        extrinsic_3x4 = extrinsic
 
-    for i in range(num_cameras):
-        R = extrinsics[i, :3, :3]
-        t = extrinsics[i, :3, 3]
+    # image_size should be [width, height] for Facebook's function
+    image_size_array = np.array([image_size[0], image_size[1]])
 
-        rot = Rotation.from_matrix(R)
-        quat = rot.as_quat()
-        quat = np.array([quat[3], quat[0], quat[1], quat[2]])  # Convert to [w, x, y, z]
+    if verbose:
+        CONSOLE.print(f"  - Calling batch_np_matrix_to_pycolmap_wo_track with {len(points3d)} 3D points")
+        CONSOLE.print(f"  - points_xyf shape: {points_xyf.shape}")
+        CONSOLE.print(f"  - Camera type: {camera_type}")
 
-        quaternions.append(quat)
-        translations.append(t)
+    # Call Facebook's function
+    reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+        points3d=points3d,
+        points_xyf=points_xyf,
+        points_rgb=points_rgb,
+        extrinsics=extrinsic_3x4,
+        intrinsics=intrinsic,
+        image_size=image_size_array,
+        shared_camera=shared_camera,
+        camera_type=camera_type,
+    )
 
-    return np.array(quaternions), np.array(translations)
+    if reconstruction is None:
+        if verbose:
+            CONSOLE.print("[bold yellow]Warning: batch_np_matrix_to_pycolmap_wo_track returned None")
+        return None
+
+    # Update image names to actual filenames
+    for i, img_path in enumerate(image_paths):
+        if (i + 1) in reconstruction.images:
+            reconstruction.images[i + 1].name = img_path.name
+
+    if verbose:
+        CONSOLE.print(f"  - Created reconstruction:")
+        CONSOLE.print(f"    - Cameras: {len(reconstruction.cameras)}")
+        CONSOLE.print(f"    - Images: {len(reconstruction.images)}")
+        CONSOLE.print(f"    - Points3D: {len(reconstruction.points3D)}")
+
+    return reconstruction
 
 
-def _filter_and_prepare_points(
+def _rescale_reconstruction_to_original_dimensions(
+    reconstruction: Any,
+    image_paths: List[Path],
+    original_image_sizes: List[Tuple[int, int]],
+    model_resolution: int,
+    shared_camera: bool,
+    verbose: bool,
+) -> Any:
+    """Rescale reconstruction from model resolution to original dimensions.
+
+    This is based on Facebook's rename_colmap_recons_and_rescale_camera function.
+    VGGT builds reconstructions at 518x518 resolution, so we need to rescale
+    camera parameters and image dimensions to match the original images.
+
+    Args:
+        reconstruction: pycolmap Reconstruction object
+        image_paths: Paths to images
+        original_image_sizes: List of (width, height) tuples for each image
+        model_resolution: Resolution used by VGGT model (518)
+        shared_camera: Whether using a single shared camera
+        verbose: Whether to print progress
+
+    Returns:
+        Updated pycolmap Reconstruction object
+    """
+    import copy
+
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Rescaling reconstruction from {model_resolution}x{model_resolution} to original dimensions")
+
+    rescale_camera = True
+
+    for pyimageid in reconstruction.images:
+        pyimage = reconstruction.images[pyimageid]
+        pycamera = reconstruction.cameras[pyimage.camera_id]
+
+        # Rename image to original filename
+        pyimage.name = image_paths[pyimageid - 1].name
+
+        if rescale_camera:
+            # Get original image dimensions
+            orig_width, orig_height = original_image_sizes[pyimageid - 1]
+            real_image_size = np.array([orig_width, orig_height])
+
+            # Calculate resize ratio
+            resize_ratio = max(real_image_size) / model_resolution
+
+            # Rescale camera parameters
+            pred_params = copy.deepcopy(pycamera.params)
+            pred_params = pred_params * resize_ratio
+
+            # Set principal point to center of original image
+            real_pp = real_image_size / 2
+            pred_params[-2:] = real_pp
+
+            # Update camera
+            pycamera.params = pred_params
+            pycamera.width = int(orig_width)
+            pycamera.height = int(orig_height)
+
+            if shared_camera:
+                # If shared camera, only need to rescale once
+                rescale_camera = False
+
+    if verbose:
+        CONSOLE.print(f"[bold green]✓ Rescaled reconstruction to original dimensions")
+
+    return reconstruction
+
+
+def _filter_and_prepare_points_for_pycolmap(
     world_points: np.ndarray,
     world_points_conf: np.ndarray,
     colors_rgb: np.ndarray,
@@ -1160,18 +1106,17 @@ def _filter_and_prepare_points(
     mask_black_bg: bool,
     mask_white_bg: bool,
     verbose: bool,
-) -> Tuple[List[Dict], List[List]]:
-    """Filter points based on confidence and prepare for COLMAP format.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Filter points using Facebook's exact approach for feedforward reconstruction.
 
-    This function is used by run_vggt() for depth-based reconstruction.
-    It filters 3D points by confidence and optional color masks, then builds
-    tracks by hashing nearby points together.
+    This function applies confidence filtering and random sampling to prepare points
+    for batch_np_matrix_to_pycolmap_wo_track, following Facebook's demo_colmap.py.
 
     Args:
         world_points: 3D points from depth unprojection (S, H, W, 3)
         world_points_conf: Confidence values for each point (S, H, W)
         colors_rgb: RGB colors for each point (S, H, W, 3)
-        conf_threshold: Percentile threshold for confidence (0-100)
+        conf_threshold: Confidence threshold value (not percentile) for filtering
         stride: Sampling stride for points (higher = fewer points)
         mask_black_bg: If True, filter out very dark points
         mask_white_bg: If True, filter out very bright points
@@ -1179,84 +1124,61 @@ def _filter_and_prepare_points(
 
     Returns:
         Tuple of:
-        - points3D: List of 3D point dictionaries with tracks
-        - image_points2D: List of 2D points per image
+        - points3d: Filtered 3D points (P, 3)
+        - points_xyf: Pixel coordinates with frame indices (P, 3) - [x, y, frame_idx]
+        - points_rgb: RGB colors (P, 3)
     """
     S, H, W = world_points.shape[:3]
 
-    vertices_3d = world_points.reshape(-1, 3)
-    conf = world_points_conf.reshape(-1)
-    colors_rgb_flat = colors_rgb.reshape(-1, 3)
-
-    # Compute confidence threshold
-    if conf_threshold == 0.0:
-        conf_thres_value = 0.0
-    else:
-        conf_thres_value = np.percentile(conf, conf_threshold)
-
     if verbose:
-        CONSOLE.print(f"  - Confidence threshold: {conf_threshold}% (value: {conf_thres_value:.4f})")
+        CONSOLE.print(f"[bold yellow]Filtering points using Facebook's approach...")
+        CONSOLE.print(f"  - Input shape: {world_points.shape}")
 
-    conf_mask = (conf >= conf_thres_value) & (conf > 1e-5)
+    # Create pixel coordinate grid (using Facebook's function directly)
+    points_xyf = create_pixel_coordinate_grid(S, H, W)
 
+    # Apply confidence threshold (Facebook uses value threshold, not percentile)
+    conf_mask = world_points_conf >= conf_threshold
+
+    # Apply color masks if requested
     if mask_black_bg:
-        black_bg_mask = colors_rgb_flat.sum(axis=1) >= 16
+        black_bg_mask = colors_rgb.sum(axis=-1) >= 16
         conf_mask = conf_mask & black_bg_mask
 
     if mask_white_bg:
         white_bg_mask = ~(
-            (colors_rgb_flat[:, 0] > 240) &
-            (colors_rgb_flat[:, 1] > 240) &
-            (colors_rgb_flat[:, 2] > 240)
+            (colors_rgb[..., 0] > 240) &
+            (colors_rgb[..., 1] > 240) &
+            (colors_rgb[..., 2] > 240)
         )
         conf_mask = conf_mask & white_bg_mask
 
-    # Build 3D points and tracks
-    points3D = []
-    point_indices = {}
-    image_points2D = [[] for _ in range(S)]
-
-    for img_idx in range(S):
-        for y in range(0, H, stride):
-            for x in range(0, W, stride):
-                flat_idx = img_idx * H * W + y * W + x
-
-                if flat_idx >= len(conf):
-                    continue
-
-                if not conf_mask[flat_idx]:
-                    continue
-
-                point3D = vertices_3d[flat_idx]
-                rgb = colors_rgb_flat[flat_idx]
-
-                if not np.all(np.isfinite(point3D)):
-                    continue
-
-                point_hash = _hash_point(point3D, scale=100)
-
-                if point_hash not in point_indices:
-                    point_idx = len(points3D)
-                    point_indices[point_hash] = point_idx
-
-                    point_entry = {
-                        "id": point_idx,
-                        "xyz": point3D,
-                        "rgb": rgb,
-                        "error": 1.0,
-                        "track": [(img_idx, len(image_points2D[img_idx]))],
-                    }
-                    points3D.append(point_entry)
-                else:
-                    point_idx = point_indices[point_hash]
-                    points3D[point_idx]["track"].append((img_idx, len(image_points2D[img_idx])))
-
-                image_points2D[img_idx].append((x, y, point_indices[point_hash]))
+    # Apply stride (subsample points)
+    if stride > 1:
+        stride_mask = np.zeros((H, W), dtype=bool)
+        stride_mask[::stride, ::stride] = True
+        stride_mask = np.broadcast_to(stride_mask[np.newaxis, :, :], (S, H, W))
+        conf_mask = conf_mask & stride_mask
 
     if verbose:
-        CONSOLE.print(f"  - Prepared {len(points3D)} 3D points")
+        CONSOLE.print(f"  - Points after confidence & mask filtering: {np.sum(conf_mask):,}")
 
-    return points3D, image_points2D
+    # Limit to max 100k points (using Facebook's function directly)
+    conf_mask = randomly_limit_trues(conf_mask, 100000)
+
+    if verbose:
+        CONSOLE.print(f"  - Points after random limiting (max 100k): {np.sum(conf_mask):,}")
+
+    # Filter points
+    points3d = world_points[conf_mask]
+    points_xyf = points_xyf[conf_mask]
+    points_rgb = colors_rgb[conf_mask]
+
+    if verbose:
+        CONSOLE.print(f"[bold green]✓ Filtered to {len(points3d):,} points")
+
+    return points3d, points_xyf, points_rgb
+
 
 
 def _hash_point(point: np.ndarray, scale: float = 100) -> int:
@@ -1277,104 +1199,5 @@ def _hash_point(point: np.ndarray, scale: float = 100) -> int:
     return hash(quantized)
 
 
-def _write_colmap_cameras_bin(file_path: Path, intrinsics: np.ndarray, image_width: int, image_height: int) -> None:
-    """Write camera intrinsics to COLMAP cameras.bin format.
-
-    Writes camera parameters in COLMAP's binary format using the PINHOLE model.
-
-    Args:
-        file_path: Output path for cameras.bin file
-        intrinsics: Camera intrinsic matrices (N, 3, 3)
-        image_width: Image width in pixels
-        image_height: Image height in pixels
-    """
-    with open(file_path, "wb") as fid:
-        fid.write(struct.pack("<Q", len(intrinsics)))
-
-        for i, intrinsic in enumerate(intrinsics):
-            camera_id = i + 1
-            model_id = 1  # PINHOLE
-
-            fx = float(intrinsic[0, 0])
-            fy = float(intrinsic[1, 1])
-            cx = float(intrinsic[0, 2])
-            cy = float(intrinsic[1, 2])
-
-            fid.write(struct.pack("<I", camera_id))
-            fid.write(struct.pack("<I", model_id))
-            fid.write(struct.pack("<Q", image_width))
-            fid.write(struct.pack("<Q", image_height))
-            fid.write(struct.pack("<dddd", fx, fy, cx, cy))
 
 
-def _write_colmap_images_bin(
-    file_path: Path,
-    quaternions: np.ndarray,
-    translations: np.ndarray,
-    image_points2D: List[List],
-    image_paths: List[Path],
-) -> None:
-    """Write camera poses and keypoints to COLMAP images.bin format.
-
-    Args:
-        file_path: Output path for images.bin file
-        quaternions: Camera rotations in quaternion format (N, 4) [w, x, y, z]
-        translations: Camera translations (N, 3)
-        image_points2D: List of 2D points per image, each as [(x, y, point3d_id), ...]
-        image_paths: Paths to image files for extracting names
-    """
-    with open(file_path, "wb") as fid:
-        fid.write(struct.pack("<Q", len(quaternions)))
-
-        for i in range(len(quaternions)):
-            image_id = i + 1
-            camera_id = i + 1
-
-            qw, qx, qy, qz = quaternions[i].astype(float)
-            tx, ty, tz = translations[i].astype(float)
-
-            image_name = image_paths[i].name.encode()
-            points = image_points2D[i]
-
-            fid.write(struct.pack("<I", image_id))
-            fid.write(struct.pack("<dddd", qw, qx, qy, qz))
-            fid.write(struct.pack("<ddd", tx, ty, tz))
-            fid.write(struct.pack("<I", camera_id))
-            fid.write(image_name + b"\x00")
-
-            fid.write(struct.pack("<Q", len(points)))
-
-            for x, y, point3d_id in points:
-                fid.write(struct.pack("<ddQ", float(x), float(y), point3d_id + 1))
-
-
-def _write_colmap_points3D_bin(file_path: Path, points3D: List[Dict]) -> None:
-    """Write 3D points and tracks to COLMAP points3D.bin format.
-
-    Args:
-        file_path: Output path for points3D.bin file
-        points3D: List of 3D point dictionaries with keys:
-            - id: Point ID
-            - xyz: 3D coordinates (3,)
-            - rgb: RGB color (3,) in range [0, 255]
-            - error: Reprojection error
-            - track: List of (image_id, point2d_idx) tuples
-    """
-    with open(file_path, "wb") as fid:
-        fid.write(struct.pack("<Q", len(points3D)))
-
-        for point in points3D:
-            point_id = point["id"] + 1
-            x, y, z = point["xyz"].astype(float)
-            r, g, b = point["rgb"].astype(np.uint8)
-            error = float(point["error"])
-            track = point["track"]
-
-            fid.write(struct.pack("<Q", point_id))
-            fid.write(struct.pack("<ddd", x, y, z))
-            fid.write(struct.pack("<BBB", int(r), int(g), int(b)))
-            fid.write(struct.pack("<d", error))
-
-            fid.write(struct.pack("<Q", len(track)))
-            for img_id, point2d_idx in track:
-                fid.write(struct.pack("<II", img_id + 1, point2d_idx))
