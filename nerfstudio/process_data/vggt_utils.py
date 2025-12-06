@@ -107,6 +107,7 @@ def run_vggt(
     shared_camera: bool = True,
     max_points_for_colmap: int = 500000,
     use_global_alignment: bool = True,
+    debug_save_intermediates: bool = False,
 ) -> None:
     """Runs VGGT on images to estimate camera poses and depth (Facebook's feedforward mode).
 
@@ -150,11 +151,24 @@ def run_vggt(
     # Extract data from inference results
     images = vggt_data["images"]
     extrinsic = vggt_data["extrinsic"]
-    intrinsic_downsampled = vggt_data["instrinsics"]
-    original_coords = vggt_data["original_coords"]
+    intrinsic = vggt_data["instrinsics"] # Upsampled to native resolution
+    intrinsic_downsampled = vggt_data["instrinsics_downsampled"] # Downsampled to VGGT resolution
+    original_coords = vggt_data["original_coords"] # [0, 0, new_width, new_height, width, height]
     depth_map = vggt_data["depth"]
     depth_conf = vggt_data["depth_conf"]
     image_paths = vggt_data["image_paths"]
+
+    # CHECKPOINT 1: Save VGGT inference outputs
+    if debug_save_intermediates:
+        debug_dir = colmap_dir / "debug_intermediates"
+        debug_dir.mkdir(exist_ok=True)
+        np.save(debug_dir / "01_extrinsic_after_inference.npy", extrinsic)
+        np.save(debug_dir / "01_intrinsic_downsampled_after_inference.npy", intrinsic_downsampled)
+        np.save(debug_dir / "01_depth_map_after_inference.npy", depth_map)
+        np.save(debug_dir / "01_depth_conf_after_inference.npy", depth_conf)
+        np.save(debug_dir / "01_original_coords.npy", original_coords)
+        if verbose:
+            CONSOLE.print(f"[bold cyan]CHECKPOINT 1: Saved VGGT inference outputs to {debug_dir}")
 
     # Use global alignment if enabled
     if use_global_alignment:
@@ -169,6 +183,13 @@ def run_vggt(
             shared_camera=shared_camera,
             verbose=verbose,
         )
+
+        # CHECKPOINT 2: Save post-global-alignment outputs
+        if debug_save_intermediates:
+            np.save(debug_dir / "02_extrinsic_after_ga.npy", extrinsic)
+            np.save(debug_dir / "02_intrinsic_downsampled_after_ga.npy", intrinsic_downsampled)
+            if verbose:
+                CONSOLE.print(f"[bold cyan]CHECKPOINT 2: Saved global alignment outputs")
     else:
         match_outputs = None
 
@@ -196,10 +217,6 @@ def run_vggt(
         intrinsic_downsampled
     )
 
-    # Grab image size from depth map (width, height) format
-    # depth_map has shape (N, H, W), so we need (W, H) order
-    image_size = np.array([depth_map.shape[2], depth_map.shape[1]])
-
     # Filter points for pycolmap reconstruction using VGGTX logic
     points3d, points_xyf, points_rgb = _filter_and_prepare_points_for_pycolmap(
         points3d=points3d,
@@ -210,12 +227,40 @@ def run_vggt(
         conf_thres_value=conf_threshold_value,
         use_global_alignment=use_global_alignment,
         max_points_for_colmap=max_points_for_colmap,
-        match_outputs=match_outputs,    )
+        match_outputs=match_outputs
+    )
+
+    # CHECKPOINT 3: Save filtered points
+    if debug_save_intermediates:
+        np.save(debug_dir / "03_points3d_filtered.npy", points3d)
+        np.save(debug_dir / "03_points_xyf_filtered.npy", points_xyf)
+        np.save(debug_dir / "03_points_rgb_filtered.npy", points_rgb)
+        if verbose:
+            CONSOLE.print(f"[bold cyan]CHECKPOINT 3: Saved filtered points ({len(points3d)} points)")
+
+    # Grab image size from depth map (N, H, W) --> make as width and height
+    image_size = np.array([depth_map.shape[2], depth_map.shape[1]])
     
     if verbose:
-        CONSOLE.print(f"[bold yellow]Building pycolmap reconstruction at {image_size[0]}x{image_size[1]}...")
+        CONSOLE.print(f"[bold yellow]Building pycolmap reconstruction at WxH ({image_size[0]}x{image_size[1]})...")
+
+    # CHECKPOINT 4: Save inputs to COLMAP builder
+    if debug_save_intermediates:
+        np.save(debug_dir / "04_image_size.npy", image_size)
+        np.save(debug_dir / "04_extrinsic_for_colmap.npy", extrinsic)
+        np.save(debug_dir / "04_intrinsic_downsampled_for_colmap.npy", intrinsic_downsampled)
+        with open(debug_dir / "04_params.txt", "w") as f:
+            f.write(f"camera_model: {camera_model}\n")
+            f.write(f"shared_camera: {shared_camera}\n")
+            f.write(f"image_size: {image_size}\n")
+            f.write(f"num_images: {len(image_paths)}\n")
+            f.write(f"num_points: {len(points3d)}\n")
+        if verbose:
+            CONSOLE.print(f"[bold cyan]CHECKPOINT 4: Saved COLMAP builder inputs")
 
     # Step 1: Build reconstruction at model resolution (518x518) using intrinsic_downsampled
+    # within batch_np_matrix_to_pycolmap_wo_track image_size is used as width = image_size[0] and height = image_size[1]
+
     reconstruction = _build_pycolmap_reconstruction_without_tracks(
         points3d=points3d,
         points_xyf=points_xyf,
@@ -223,7 +268,7 @@ def run_vggt(
         extrinsic=extrinsic,
         intrinsic=intrinsic_downsampled,
         image_paths=image_paths,
-        image_size=image_size,
+        image_size=image_size, # [W, H]
         shared_camera=shared_camera,
         camera_type=camera_model,
         verbose=verbose,
@@ -233,9 +278,26 @@ def run_vggt(
         CONSOLE.print("[bold red]Error: Failed to build pycolmap reconstruction!")
         sys.exit(1)
 
-    # Step 2: Rescale reconstruction to original dimensions
-    reconstruction_resolution = (depth_map.shape[2], depth_map.shape[1])
-        
+    # CHECKPOINT 5: Save reconstruction before rescaling
+    if debug_save_intermediates:
+        cam = list(reconstruction.cameras.values())[0]
+        img = list(reconstruction.images.values())[0]
+        with open(debug_dir / "05_before_rescale.txt", "w") as f:
+            f.write(f"Camera model: {cam.model}\n")
+            f.write(f"Camera WxH: {cam.width}x{cam.height}\n")
+            f.write(f"Camera params: {cam.params}\n")
+            f.write(f"Image name: {img.name}\n")
+            f.write(f"Num cameras: {len(reconstruction.cameras)}\n")
+            f.write(f"Num images: {len(reconstruction.images)}\n")
+            f.write(f"Num 3D points: {len(reconstruction.points3D)}\n")
+            if len(img.points2D) > 0:
+                f.write(f"Sample point2D: {img.points2D[0].xy}\n")
+        if verbose:
+            CONSOLE.print(f"[bold cyan]CHECKPOINT 5: Saved reconstruction before rescaling")
+
+    # # Step 2: Rescale reconstruction to original dimensions
+    reconstruction_resolution = (image_size[0], image_size[1]) # Reverse as it expects width and height
+
     reconstruction = _rescale_reconstruction_to_original_dimensions(
         reconstruction=reconstruction,
         image_paths=image_paths,
@@ -245,6 +307,23 @@ def run_vggt(
         shared_camera=shared_camera,
         verbose=verbose,
     )
+
+    # CHECKPOINT 6: Save reconstruction after rescaling
+    if debug_save_intermediates:
+        cam = list(reconstruction.cameras.values())[0]
+        img = list(reconstruction.images.values())[0]
+        with open(debug_dir / "06_after_rescale.txt", "w") as f:
+            f.write(f"Camera model: {cam.model}\n")
+            f.write(f"Camera WxH: {cam.width}x{cam.height}\n")
+            f.write(f"Camera params: {cam.params}\n")
+            f.write(f"Image name: {img.name}\n")
+            f.write(f"Num cameras: {len(reconstruction.cameras)}\n")
+            f.write(f"Num images: {len(reconstruction.images)}\n")
+            f.write(f"Num 3D points: {len(reconstruction.points3D)}\n")
+            if len(img.points2D) > 0:
+                f.write(f"Sample point2D: {img.points2D[0].xy}\n")
+        if verbose:
+            CONSOLE.print(f"[bold cyan]CHECKPOINT 6: Saved reconstruction after rescaling")
 
     # Write reconstruction to binary format
     if verbose:
@@ -788,8 +867,11 @@ def _run_vggt_inference(
     images, original_coords = load_and_preprocess_images_ratio(image_names, img_load_resolution)
 
     # Move tensors to device and to target dtype (match with model expectation)
+    # Images are (B, 3, H, W)
     images = images.to(device, dtype=dtype)
     original_coords = original_coords.to(device)
+
+    width, height = original_coords[0, -2:]
 
     # Save processed image shape (HxW) for later pose decoding and debug info
     image_shape = images.shape[-2:]
@@ -806,10 +888,13 @@ def _run_vggt_inference(
         predictions = model(images)
 
         # Get extrinsics and intrinsics (at resolution of processing images)
+        # pose_encoding takes image shape (H, W)
         extrinsic, intrinsic_downsampled = pose_encoding_to_extri_intri(predictions["pose_enc"], image_shape)
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], [width, height])
 
         # Squeeze and move to CPU
         extrinsic = extrinsic.cpu().float().numpy().squeeze(0)
+        intrinsic = intrinsic.cpu().float().numpy().squeeze(0)
         intrinsic_downsampled = intrinsic_downsampled.cpu().float().numpy().squeeze(0)
         depth_map = predictions['depth'].squeeze(0).cpu().float().numpy()
         depth_conf = predictions['depth_conf'].squeeze(0).cpu().float().numpy()
@@ -835,7 +920,8 @@ def _run_vggt_inference(
     return {
         "images": images,
         "extrinsic": extrinsic,
-        "instrinsics": intrinsic_downsampled,
+        "instrinsics": intrinsic,
+        "instrinsics_downsampled": intrinsic_downsampled,
         "depth": depth_map,
         "depth_conf": depth_conf,
         "image_paths": image_paths,
@@ -1056,7 +1142,7 @@ def _build_pycolmap_reconstruction_without_tracks(
         points_rgb=points_rgb,
         extrinsics=extrinsic_3x4,
         intrinsics=intrinsic,
-        image_size=image_size_array,
+        image_size=image_size_array, # Image size here is width height -->
         shared_camera=shared_camera,
         camera_type=camera_type,
     )
@@ -1110,7 +1196,10 @@ def _rescale_reconstruction_to_original_dimensions(
     import copy
 
     if verbose:
-        CONSOLE.print(f"[bold yellow]Rescaling reconstruction from {image_size[0]}x{image_size[1]} to original dimensions")
+        sample_image = original_image_sizes[0, -2:]
+        original_width, original_height = sample_image
+        CONSOLE.print(f"[bold yellow]Rescaling reconstruction from WxH ({image_size[0]}x{image_size[1]}) to original dimensions")
+        CONSOLE.print(f"  - Original image sizes (WxH): {original_width}x{original_height}")
 
     rescale_camera = True
 
@@ -1124,6 +1213,7 @@ def _rescale_reconstruction_to_original_dimensions(
         if rescale_camera:
             pred_params = copy.deepcopy(pycamera.params)
 
+            # Grabs original W / H
             real_image_size = original_image_sizes[pyimageid - 1, -2:]
             scale_x = real_image_size[0] / image_size[0]
             scale_y = real_image_size[1] / image_size[1]
@@ -1136,28 +1226,21 @@ def _rescale_reconstruction_to_original_dimensions(
             # PINHOLE:        [fx, fy, cx, cy]
             # SIMPLE_RADIAL:  [f, cx, cy, k]
             # OPENCV:         [fx, fy, cx, cy, ... distortion ...]
-
-            # If model has ONE focal length (SIMPLE_PINHOLE, SIMPLE_RADIAL)
-            if len(pred_params) >= 1:
-                # Use the dominant resize factor (consistent with COLMAP behavior)
+            if pycamera.model == "SIMPLE_PINHOLE":
+                # SIMPLE_PINHOLE: [f, cx, cy]
                 pred_params[0] *= max(scale_x, scale_y)
-
-            # If model has SEPARATE fx, fy (PINHOLE, OPENCV, RADIAL, etc.)
-            if len(pred_params) >= 2:
-                # fx is index 0 OR 1 depending on model — but simple safe logic:
-                # For PINHOLE/OPENCV: fx=0, fy=1
-                # For SIMPLE_PINHOLE: param[1] is cx, so don't scale it here.
-                # We only scale fy if params looks like fx, fy, cx, cy
-                if pycamera.model in ("PINHOLE", "OPENCV", "RADIAL", "OPENCV_FISHEYE"):
-                    pred_params[0] *= scale_x  # fx
-                    pred_params[1] *= scale_y  # fy
+            elif pycamera.model in ("PINHOLE", "OPENCV", "RADIAL", "OPENCV_FISHEYE"):
+                # PINHOLE: [fx, fy, cx, cy, ...]
+                pred_params[0] *= scale_x  # fx
+                pred_params[1] *= scale_y  # fy
 
             # -------------------------------
             # Rescale principal point (cx, cy)
             # -------------------------------
             # In EVERY COLMAP model, the last two entries of params are cx, cy
-            pred_params[-2:] = real_image_size / 2
-
+            pred_params[-2] = pred_params[-2] * scale_x
+            pred_params[-1] = pred_params[-1] * scale_y
+            
             # -------------------------------
             # Apply back to camera object
             # -------------------------------
@@ -1427,9 +1510,6 @@ def _run_global_alignment(
     # (Following VGGT-X demo_colmap.py pattern)
     return extrinsic_refined, intrinsic_refined, match_outputs
 
-
-
-
 ################################################################################
 ######################  VGGT-X HELPER FUNCTIONS   ##############################
 ################################################################################
@@ -1635,11 +1715,11 @@ def extract_matches(
     corr_weights /= corr_weights.mean()
     
     # set corr_weights to 0 for points outside the image frame
-    in_frame_i = (corr_points_i[..., 0] > images.shape[-1]) & (corr_points_i[..., 0] < 0) & \
-                    (corr_points_i[..., 1] > images.shape[-2]) & (corr_points_i[..., 1] < 0)
-    in_frame_j = (corr_points_j[..., 0] > images.shape[-1]) & (corr_points_j[..., 0] < 0) & \
-                    (corr_points_j[..., 1] > images.shape[-2]) & (corr_points_j[..., 1] < 0)
-    corr_weights[in_frame_i & in_frame_j] = 0.0
+    out_of_frame_i = (corr_points_i[..., 0] >= images.shape[-1]) | (corr_points_i[..., 0] < 0) | \
+                     (corr_points_i[..., 1] >= images.shape[-2]) | (corr_points_i[..., 1] < 0)
+    out_of_frame_j = (corr_points_j[..., 0] >= images.shape[-1]) | (corr_points_j[..., 0] < 0) | \
+                     (corr_points_j[..., 1] >= images.shape[-2]) | (corr_points_j[..., 1] < 0)
+    corr_weights[out_of_frame_i | out_of_frame_j] = 0.0
     
     # rearrange corr_points_i_normalized and corr_points_j_normalized to (P, N, 2)
     P, N = len(num_matches), max(num_matches)
