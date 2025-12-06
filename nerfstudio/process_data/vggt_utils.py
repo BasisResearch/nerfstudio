@@ -1264,9 +1264,9 @@ def _rescale_reconstruction_to_original_dimensions(
             for point2D in pyimage.points2D:
                 point2D.xy = (point2D.xy - top_left) * np.array([scale_x, scale_y])
 
-        # if shared_camera:
-        #     # If shared camera, only need to rescale once
-        #     rescale_camera = False
+        if shared_camera:
+            # If shared camera, only need to rescale once
+            rescale_camera = False
 
     if verbose:
         CONSOLE.print(f"[bold green]✓ Rescaled reconstruction to original dimensions")
