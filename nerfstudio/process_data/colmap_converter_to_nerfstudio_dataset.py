@@ -49,6 +49,9 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     This follows the official VGGT demo approach using predict_tracks() and
     batch_np_matrix_to_pycolmap(). If False, uses simpler depth-based reconstruction.
     Only works with vggt sfm_tool."""
+    vggt_conf_threshold: float = 50.0
+    """Confidence threshold for VGGT.
+    Only works with vggt sfm_tool."""
     feature_type: Literal[
         "any",
         "sift",
@@ -274,6 +277,8 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 camera_model=CAMERA_MODELS[self.camera_type].name,
                 verbose=self.verbose,
                 use_global_alignment=self.refine_vggt,
+                conf_threshold=self.vggt_conf_threshold,
+                shared_camera=self.use_single_camera_mode,
             )
         else:
             raise RuntimeError("Invalid combination of sfm_tool, feature_type, and matcher_type, exiting")

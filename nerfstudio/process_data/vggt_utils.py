@@ -62,6 +62,8 @@ import pycolmap
 from tqdm import tqdm
 import roma
 import kornia
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for headless servers
 import matplotlib.pyplot as plt
 
 # Try to import vggt - it's an optional dependency
@@ -1226,10 +1228,11 @@ def _rescale_reconstruction_to_original_dimensions(
             # PINHOLE:        [fx, fy, cx, cy]
             # SIMPLE_RADIAL:  [f, cx, cy, k]
             # OPENCV:         [fx, fy, cx, cy, ... distortion ...]
-            if pycamera.model == "SIMPLE_PINHOLE":
+            # NOTE: pycamera.model is a CameraModelId enum, not a string, so we use .name
+            if pycamera.model.name == "SIMPLE_PINHOLE":
                 # SIMPLE_PINHOLE: [f, cx, cy]
                 pred_params[0] *= max(scale_x, scale_y)
-            elif pycamera.model in ("PINHOLE", "OPENCV", "RADIAL", "OPENCV_FISHEYE"):
+            elif pycamera.model.name in ("PINHOLE", "OPENCV", "RADIAL", "OPENCV_FISHEYE"):
                 # PINHOLE: [fx, fy, cx, cy, ...]
                 pred_params[0] *= scale_x  # fx
                 pred_params[1] *= scale_y  # fy
@@ -1261,9 +1264,9 @@ def _rescale_reconstruction_to_original_dimensions(
             for point2D in pyimage.points2D:
                 point2D.xy = (point2D.xy - top_left) * np.array([scale_x, scale_y])
 
-        if shared_camera:
-            # If shared camera, only need to rescale once
-            rescale_camera = False
+        # if shared_camera:
+        #     # If shared camera, only need to rescale once
+        #     rescale_camera = False
 
     if verbose:
         CONSOLE.print(f"[bold green]✓ Rescaled reconstruction to original dimensions")
@@ -1873,8 +1876,9 @@ def pose_optimization(
         plt.xlabel('Iteration')
         plt.ylabel('Loss Value')
         plt.title(f'Loss Curve, final loss={loss_list[-1]:.4f}')
-        plt.show()
-        plt.savefig(f"{target_scene_dir}/loss_curve_pose_opt.png")
+        # plt.show()
+        plt.savefig(f"{target_scene_dir}/loss_curve_pose_opt.jpg")
+        plt.close()  # Close figure to free memory
 
     
     output_extrinsic = w2cam[:, :3, :4].detach().cpu().numpy()
