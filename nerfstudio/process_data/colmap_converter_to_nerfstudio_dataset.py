@@ -52,6 +52,10 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
     vggt_conf_threshold: float = 50.0
     """Confidence threshold for VGGT.
     Only works with vggt sfm_tool."""
+    vggt_lambda_depth: float = 0.0
+    """Weight for depth consistency loss in VGGT pose optimization.
+    Set to 0.0 to disable depth consistency (default). Recommended values: 0.1-1.0.
+    Only works with vggt sfm_tool."""
     feature_type: Literal[
         "any",
         "sift",
@@ -279,6 +283,8 @@ class ColmapConverterToNerfstudioDataset(BaseConverterToNerfstudioDataset):
                 use_global_alignment=self.refine_vggt,
                 conf_threshold=self.vggt_conf_threshold,
                 shared_camera=self.use_single_camera_mode,
+                filter_outlier_cameras=True,
+                lambda_depth=self.vggt_lambda_depth,
             )
         else:
             raise RuntimeError("Invalid combination of sfm_tool, feature_type, and matcher_type, exiting")

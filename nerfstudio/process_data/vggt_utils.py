@@ -109,7 +109,8 @@ def run_vggt(
     shared_camera: bool = True,
     max_points_for_colmap: int = 500000,
     use_global_alignment: bool = True,
-    debug_save_intermediates: bool = False,
+    filter_outlier_cameras: bool = False,
+    lambda_depth: float = 0.0,
 ) -> None:
     """Runs VGGT on images to estimate camera poses and depth (Facebook's feedforward mode).
 
@@ -129,6 +130,8 @@ def run_vggt(
         model_name: HuggingFace model name for VGGT.
         chunk_size: Chunk size for VGGT-X inference.
         shared_camera: If True, use single camera model for all frames.
+        use_global_alignment: If True, perform global alignment to refine poses.
+        filter_outlier_cameras: If True, filter outlier cameras after reconstruction (requires use_global_alignment=True).
     """
     if not is_vggt_available():
         CONSOLE.print(
@@ -141,14 +144,26 @@ def run_vggt(
     # Create output directory
     output_dir = colmap_dir / "sparse" / "0"
     output_dir.mkdir(parents=True, exist_ok=True)
+    vggt_ckpt_path = colmap_dir / "vggt_checkpoint.pt"
 
     # Run VGGT inference
-    vggt_data = _run_vggt_inference(
-        image_dir=image_dir,
-        model_name=model_name,
-        chunk_size=chunk_size,
-        verbose=verbose,
-    )
+    if vggt_ckpt_path.exists():
+        vggt_data = torch.load(vggt_ckpt_path)
+    else:
+        vggt_data = _run_vggt_inference(
+            image_dir=image_dir,
+            model_name=model_name,
+            chunk_size=chunk_size,
+            verbose=verbose,
+        )
+
+        torch.save(vggt_data, vggt_ckpt_path)
+
+        if verbose:
+            CONSOLE.print(f"[bold green]✓ Saved VGGT checkpoint to {vggt_ckpt_path}")
+            CONSOLE.print(f"  Use this checkpoint for rapid testing of match extraction!")
+            CONSOLE.print(f"  Example: python test_ransac_filtering.py --checkpoint {vggt_ckpt_path}")
+
 
     # Extract data from inference results
     images = vggt_data["images"]
@@ -160,18 +175,6 @@ def run_vggt(
     depth_conf = vggt_data["depth_conf"]
     image_paths = vggt_data["image_paths"]
 
-    # CHECKPOINT 1: Save VGGT inference outputs
-    if debug_save_intermediates:
-        debug_dir = colmap_dir / "debug_intermediates"
-        debug_dir.mkdir(exist_ok=True)
-        np.save(debug_dir / "01_extrinsic_after_inference.npy", extrinsic)
-        np.save(debug_dir / "01_intrinsic_downsampled_after_inference.npy", intrinsic_downsampled)
-        np.save(debug_dir / "01_depth_map_after_inference.npy", depth_map)
-        np.save(debug_dir / "01_depth_conf_after_inference.npy", depth_conf)
-        np.save(debug_dir / "01_original_coords.npy", original_coords)
-        if verbose:
-            CONSOLE.print(f"[bold cyan]CHECKPOINT 1: Saved VGGT inference outputs to {debug_dir}")
-
     # Use global alignment if enabled
     if use_global_alignment:
         # Optimized camera poses using feature matching
@@ -180,18 +183,13 @@ def run_vggt(
             image_paths=image_paths,
             extrinsic=extrinsic,
             intrinsic=intrinsic_downsampled,
+            depth_map=depth_map,
             depth_conf=depth_conf,
+            lambda_depth=lambda_depth,
             colmap_dir=colmap_dir,
             shared_camera=shared_camera,
             verbose=verbose,
         )
-
-        # CHECKPOINT 2: Save post-global-alignment outputs
-        if debug_save_intermediates:
-            np.save(debug_dir / "02_extrinsic_after_ga.npy", extrinsic)
-            np.save(debug_dir / "02_intrinsic_downsampled_after_ga.npy", intrinsic_downsampled)
-            if verbose:
-                CONSOLE.print(f"[bold cyan]CHECKPOINT 2: Saved global alignment outputs")
     else:
         match_outputs = None
 
@@ -232,33 +230,11 @@ def run_vggt(
         match_outputs=match_outputs
     )
 
-    # CHECKPOINT 3: Save filtered points
-    if debug_save_intermediates:
-        np.save(debug_dir / "03_points3d_filtered.npy", points3d)
-        np.save(debug_dir / "03_points_xyf_filtered.npy", points_xyf)
-        np.save(debug_dir / "03_points_rgb_filtered.npy", points_rgb)
-        if verbose:
-            CONSOLE.print(f"[bold cyan]CHECKPOINT 3: Saved filtered points ({len(points3d)} points)")
-
     # Grab image size from depth map (N, H, W) --> make as width and height
     image_size = np.array([depth_map.shape[2], depth_map.shape[1]])
     
     if verbose:
         CONSOLE.print(f"[bold yellow]Building pycolmap reconstruction at WxH ({image_size[0]}x{image_size[1]})...")
-
-    # CHECKPOINT 4: Save inputs to COLMAP builder
-    if debug_save_intermediates:
-        np.save(debug_dir / "04_image_size.npy", image_size)
-        np.save(debug_dir / "04_extrinsic_for_colmap.npy", extrinsic)
-        np.save(debug_dir / "04_intrinsic_downsampled_for_colmap.npy", intrinsic_downsampled)
-        with open(debug_dir / "04_params.txt", "w") as f:
-            f.write(f"camera_model: {camera_model}\n")
-            f.write(f"shared_camera: {shared_camera}\n")
-            f.write(f"image_size: {image_size}\n")
-            f.write(f"num_images: {len(image_paths)}\n")
-            f.write(f"num_points: {len(points3d)}\n")
-        if verbose:
-            CONSOLE.print(f"[bold cyan]CHECKPOINT 4: Saved COLMAP builder inputs")
 
     # Step 1: Build reconstruction at model resolution (518x518) using intrinsic_downsampled
     # within batch_np_matrix_to_pycolmap_wo_track image_size is used as width = image_size[0] and height = image_size[1]
@@ -280,23 +256,6 @@ def run_vggt(
         CONSOLE.print("[bold red]Error: Failed to build pycolmap reconstruction!")
         sys.exit(1)
 
-    # CHECKPOINT 5: Save reconstruction before rescaling
-    if debug_save_intermediates:
-        cam = list(reconstruction.cameras.values())[0]
-        img = list(reconstruction.images.values())[0]
-        with open(debug_dir / "05_before_rescale.txt", "w") as f:
-            f.write(f"Camera model: {cam.model}\n")
-            f.write(f"Camera WxH: {cam.width}x{cam.height}\n")
-            f.write(f"Camera params: {cam.params}\n")
-            f.write(f"Image name: {img.name}\n")
-            f.write(f"Num cameras: {len(reconstruction.cameras)}\n")
-            f.write(f"Num images: {len(reconstruction.images)}\n")
-            f.write(f"Num 3D points: {len(reconstruction.points3D)}\n")
-            if len(img.points2D) > 0:
-                f.write(f"Sample point2D: {img.points2D[0].xy}\n")
-        if verbose:
-            CONSOLE.print(f"[bold cyan]CHECKPOINT 5: Saved reconstruction before rescaling")
-
     # # Step 2: Rescale reconstruction to original dimensions
     reconstruction_resolution = (image_size[0], image_size[1]) # Reverse as it expects width and height
 
@@ -310,23 +269,26 @@ def run_vggt(
         verbose=verbose,
     )
 
-    # CHECKPOINT 6: Save reconstruction after rescaling
-    if debug_save_intermediates:
-        cam = list(reconstruction.cameras.values())[0]
-        img = list(reconstruction.images.values())[0]
-        with open(debug_dir / "06_after_rescale.txt", "w") as f:
-            f.write(f"Camera model: {cam.model}\n")
-            f.write(f"Camera WxH: {cam.width}x{cam.height}\n")
-            f.write(f"Camera params: {cam.params}\n")
-            f.write(f"Image name: {img.name}\n")
-            f.write(f"Num cameras: {len(reconstruction.cameras)}\n")
-            f.write(f"Num images: {len(reconstruction.images)}\n")
-            f.write(f"Num 3D points: {len(reconstruction.points3D)}\n")
-            if len(img.points2D) > 0:
-                f.write(f"Sample point2D: {img.points2D[0].xy}\n")
+    # Step 3: Filter outlier cameras (if enabled)
+    if use_global_alignment and filter_outlier_cameras:
         if verbose:
-            CONSOLE.print(f"[bold cyan]CHECKPOINT 6: Saved reconstruction after rescaling")
+            CONSOLE.print(f"[bold yellow]Filtering outlier cameras...")
 
+        reconstruction, removed_ids = _filter_outlier_cameras(
+            reconstruction=reconstruction,
+            match_outputs=match_outputs,
+            depth_conf=depth_conf,
+            pose_distance_std_factor=2.0,
+            min_matches=200,
+            min_points_3d=250,
+            verbose=verbose,
+        )
+
+        if len(removed_ids) > 0:
+            CONSOLE.print(f"[bold yellow]Filtered {len(removed_ids)} outlier cameras from reconstruction")
+            if verbose:
+                CONSOLE.print(f"  - Removed image IDs: {removed_ids}")
+    
     # Write reconstruction to binary format
     if verbose:
         CONSOLE.print(f"[bold yellow]Writing COLMAP files to {output_dir}")
@@ -1273,6 +1235,240 @@ def _rescale_reconstruction_to_original_dimensions(
 
     return reconstruction
 
+def _filter_outlier_cameras(
+    reconstruction: Any,
+    match_outputs: Optional[Dict[str, Any]] = None,
+    depth_conf: Optional[np.ndarray] = None,
+    extrinsic: Optional[np.ndarray] = None,
+    images: Optional[torch.Tensor] = None,
+    min_points_3d: int = 50,
+    error_std_factor: float = 2.0,
+    min_matches: int = 100,
+    min_avg_depth_conf: float = 0.3,
+    reprojection_error_percentile: float = 95,
+    pose_distance_std_factor: float = 2.0,
+    rotation_angle_threshold: float = 30.0,
+    verbose: bool = False,
+) -> Tuple[Any, List[int]]:
+    """
+    Filter outlier cameras based on multiple quality metrics.
+
+    Inspired by CityGaussian SfM outlier detection:
+    https://github.com/Linketic/CityGaussian/blob/e84c7c8774dd11d3f4189be3488e1220afa20a86/internal/utils/sfm_outlier_detection.py
+
+    Args:
+        reconstruction: pycolmap Reconstruction object
+        match_outputs: Optional dictionary containing match information from global alignment
+        depth_conf: Optional depth confidence array (N, H, W)
+        extrinsic: Optional extrinsic matrices (N, 4, 4) for pose discontinuity detection
+        images: Optional image tensor (not currently used)
+        min_points_3d: Minimum number of 3D points a camera must have
+        error_std_factor: Number of standard deviations above mean for error filtering
+        min_matches: Minimum number of feature matches a camera must have
+        min_avg_depth_conf: Minimum average depth confidence threshold
+        reprojection_error_percentile: Percentile threshold for reprojection error filtering
+        pose_distance_std_factor: Number of standard deviations for pose discontinuity detection
+        rotation_angle_threshold: Maximum rotation angle change (degrees) between consecutive frames
+        verbose: Whether to print filtering details
+
+    Returns:
+        Tuple of (filtered reconstruction, list of removed image IDs)
+    """
+    import copy
+
+    filtered_reconstruction = copy.deepcopy(reconstruction)
+    removed_image_ids = []
+
+    # Metric 1: Number of 3D points each camera contributes to
+    image_point_counts = {}
+    for img_id in reconstruction.images:
+        point_count = len([p for p in reconstruction.images[img_id].points2D if p.point3D_id != -1])
+        image_point_counts[img_id] = point_count
+
+    # Metric 2: Epipolar error per camera (if match_outputs available)
+    image_epipolar_errors = {}
+    if match_outputs is not None and "indexes_i_expanded" in match_outputs:
+        corr_weights = match_outputs["corr_weights"]
+        indexes_i = match_outputs["indexes_i_expanded"]
+        indexes_j = match_outputs["indexes_j_expanded"]
+
+        # Convert to numpy for efficiency if it's a tensor
+        if isinstance(corr_weights, torch.Tensor):
+            if corr_weights.ndim == 3:
+                # Flatten batched weights (P, N, 1) -> flat array matching indexes
+                num_matches = match_outputs["num_matches"]
+                weights_list = []
+                for p_idx in range(len(num_matches)):
+                    weights_list.append(corr_weights[p_idx, :num_matches[p_idx], 0].cpu().numpy())
+                corr_weights_flat = np.concatenate(weights_list)
+            else:
+                corr_weights_flat = corr_weights.cpu().numpy()
+        else:
+            corr_weights_flat = corr_weights
+
+        # Compute per-camera error contribution
+        for img_id in reconstruction.images:
+            # Find matches involving this camera (COLMAP uses 1-indexed, matches use 0-indexed)
+            mask_i = (indexes_i == img_id - 1)
+            mask_j = (indexes_j == img_id - 1)
+            mask = mask_i | mask_j
+
+            if mask.sum() > 0:
+                # Use match weight as error proxy (1.0 - weight = error)
+                avg_error = float((1.0 - corr_weights_flat[mask]).mean())
+                image_epipolar_errors[img_id] = avg_error
+            else:
+                image_epipolar_errors[img_id] = float('inf')
+
+    # Metric 3: Average depth confidence (if available)
+    image_depth_conf = {}
+    if depth_conf is not None:
+        for img_id in reconstruction.images:
+            avg_conf = depth_conf[img_id - 1].mean()
+            image_depth_conf[img_id] = avg_conf
+
+    # Filter by number of matches (if match_outputs available)
+    if match_outputs is not None and "indexes_i_expanded" in match_outputs:
+        indexes_i = match_outputs["indexes_i_expanded"]
+        indexes_j = match_outputs["indexes_j_expanded"]
+
+        for img_id in reconstruction.images:
+            # Count matches involving this camera
+            mask_i = (indexes_i == img_id - 1)
+            mask_j = (indexes_j == img_id - 1)
+            match_count = (mask_i | mask_j).sum()
+
+            if match_count < min_matches:
+                removed_image_ids.append(img_id)
+                if verbose:
+                    CONSOLE.print(f"[yellow]Removing image {img_id}: only {match_count} matches (< {min_matches})")
+
+    # Filter by 3D points
+    for img_id, point_count in image_point_counts.items():
+        if point_count < min_points_3d and img_id not in removed_image_ids:
+            removed_image_ids.append(img_id)
+            if verbose:
+                CONSOLE.print(f"[yellow]Removing image {img_id}: only {point_count} 3D points (< {min_points_3d})")
+
+    # Filter by average depth confidence
+    if depth_conf is not None:
+        for img_id in reconstruction.images:
+            if img_id in removed_image_ids:
+                continue
+            avg_conf = depth_conf[img_id - 1].mean()
+            if avg_conf < min_avg_depth_conf:
+                removed_image_ids.append(img_id)
+                if verbose:
+                    CONSOLE.print(f"[yellow]Removing image {img_id}: depth conf {avg_conf:.3f} < {min_avg_depth_conf}")
+
+    # Statistical filtering by epipolar error
+    if image_epipolar_errors:
+        errors = np.array(list(image_epipolar_errors.values()))
+        valid_errors = errors[errors != float('inf')]
+
+        if len(valid_errors) > 0:
+            mean_error = valid_errors.mean()
+            std_error = valid_errors.std()
+            threshold = mean_error + error_std_factor * std_error
+
+            for img_id, error in image_epipolar_errors.items():
+                if error > threshold and img_id not in removed_image_ids:
+                    removed_image_ids.append(img_id)
+                    if verbose:
+                        CONSOLE.print(f"[yellow]Removing image {img_id}: epipolar error {error:.3f} > {threshold:.3f}")
+
+    # Filter by pose discontinuity (MAD from neighbors)
+    if extrinsic is not None:
+        camera_positions = extrinsic[:, :3, 3]
+        n_neighbors = 3  # number of neighbors on each side
+        num_cameras = len(camera_positions)
+
+        for i in range(num_cameras):
+            img_id = i + 1
+            if img_id in removed_image_ids:
+                continue
+
+            # Select neighbor indices
+            neighbor_indices = [j for j in range(max(0, i - n_neighbors), min(num_cameras, i + n_neighbors + 1))
+                                if j != i]
+
+            # Compute mean absolute deviation from neighbors
+            neighbor_positions = camera_positions[neighbor_indices]
+            mad = np.mean(np.linalg.norm(neighbor_positions - camera_positions[i], axis=1))
+
+            # Compute global MAD threshold
+            all_mads = []
+            for k in range(num_cameras):
+                neighbor_idx_k = [j for j in range(max(0, k - n_neighbors), min(num_cameras, k + n_neighbors + 1))
+                                if j != k]
+                neighbor_pos_k = camera_positions[neighbor_idx_k]
+                all_mads.append(np.mean(np.linalg.norm(neighbor_pos_k - camera_positions[k], axis=1)))
+            threshold_mad = np.mean(all_mads) + pose_distance_std_factor * np.std(all_mads)
+
+            if mad > threshold_mad:
+                removed_image_ids.append(img_id)
+                if verbose:
+                    CONSOLE.print(f"[yellow]Removing image {img_id}: pose MAD {mad:.3f} > {threshold_mad:.3f}")
+
+    # Filter by rotation discontinuity
+    if extrinsic is not None and len(extrinsic) > 2:
+        for i in range(1, len(extrinsic) - 1):
+            img_id = i + 1
+            if img_id in removed_image_ids:
+                continue
+            R_curr = extrinsic[i, :3, :3]
+            R_prev = extrinsic[i-1, :3, :3]
+            R_next = extrinsic[i+1, :3, :3]
+
+            # Relative rotations
+            R_rel_prev = R_prev.T @ R_curr
+            R_rel_next = R_curr.T @ R_next
+
+            # Rotation angle (degrees)
+            angle_prev = np.degrees(np.arccos(np.clip((np.trace(R_rel_prev) - 1)/2, -1, 1)))
+            angle_next = np.degrees(np.arccos(np.clip((np.trace(R_rel_next) - 1)/2, -1, 1)))
+
+            if angle_prev > rotation_angle_threshold or angle_next > rotation_angle_threshold:
+                removed_image_ids.append(img_id)
+                if verbose:
+                    max_angle = max(angle_prev, angle_next)
+                    CONSOLE.print(f"[yellow]Removing image {img_id}: rotation jump {max_angle:.1f}° > {rotation_angle_threshold}°")
+
+    # Remove filtered images from reconstruction
+    # IMPORTANT: Must call deregister_image() before deleting to maintain
+    # internal registration state consistency. Without this, num_reg_images()
+    # will be out of sync with the actual image count, causing write_binary()
+    # to create corrupted files that fail to read with:
+    # "struct.error: unpack requires a buffer of 64 bytes"
+    removed_image_ids = list(set(removed_image_ids))
+    for img_id in removed_image_ids:
+        filtered_reconstruction.deregister_image(img_id)
+        del filtered_reconstruction.images[img_id]
+
+    # Clean up 3D points that lost observations
+    points_to_remove = []
+    for point3D_id in filtered_reconstruction.points3D:
+        track = filtered_reconstruction.points3D[point3D_id].track
+        # Remove track elements from deleted cameras
+        track.elements = [elem for elem in track.elements if elem.image_id not in removed_image_ids]
+
+        # If track has no observations left, mark for removal
+        # Note: For track-free reconstructions (VGGT), tracks typically have 1 element
+        # so we only remove if ALL observations are gone
+        if len(track.elements) == 0:
+            points_to_remove.append(point3D_id)
+
+    for point3D_id in points_to_remove:
+        del filtered_reconstruction.points3D[point3D_id]
+
+    if verbose:
+        CONSOLE.print(f"[bold green]✓ Filtered {len(removed_image_ids)} outlier cameras")
+        CONSOLE.print(f"  - Removed {len(points_to_remove)} 3D points with insufficient observations")
+        CONSOLE.print(f"  - Remaining: {len(filtered_reconstruction.images)} cameras, {len(filtered_reconstruction.points3D)} points")
+
+    return filtered_reconstruction, removed_image_ids
+
+
 def _filter_and_prepare_points_for_pycolmap(
     points3d: np.ndarray,
     depth_map: np.ndarray,
@@ -1328,108 +1524,6 @@ def _filter_and_prepare_points_for_pycolmap(
 
     return filtered_points_3d, filtered_points_xyf, filtered_points_rgb
 
-# def _filter_and_prepare_points_for_pycolmap(
-#     world_points: np.ndarray,
-#     world_points_conf: np.ndarray,
-#     colors_rgb: np.ndarray,
-#     conf_threshold: float,
-#     stride: int,
-#     mask_black_bg: bool,
-#     mask_white_bg: bool,
-#     verbose: bool,
-# ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-#     """Filter points using Facebook's exact approach for feedforward reconstruction.
-
-#     This function applies confidence filtering and random sampling to prepare points
-#     for batch_np_matrix_to_pycolmap_wo_track, following Facebook's demo_colmap.py.
-
-#     Args:
-#         world_points: 3D points from depth unprojection (S, H, W, 3)
-#         world_points_conf: Confidence values for each point (S, H, W)
-#         colors_rgb: RGB colors for each point (S, H, W, 3)
-#         conf_threshold: Confidence threshold value (not percentile) for filtering
-#         stride: Sampling stride for points (higher = fewer points)
-#         mask_black_bg: If True, filter out very dark points
-#         mask_white_bg: If True, filter out very bright points
-#         verbose: If True, log progress
-
-#     Returns:
-#         Tuple of:
-#         - points3d: Filtered 3D points (P, 3)
-#         - points_xyf: Pixel coordinates with frame indices (P, 3) - [x, y, frame_idx]
-#         - points_rgb: RGB colors (P, 3)
-#     """
-#     S, H, W = world_points.shape[:3]
-
-#     if verbose:
-#         CONSOLE.print(f"[bold yellow]Filtering points using Facebook's approach...")
-#         CONSOLE.print(f"  - Input shape: {world_points.shape}")
-
-#     # Create pixel coordinate grid (using Facebook's function directly)
-#     points_xyf = create_pixel_coordinate_grid(S, H, W)
-
-#     # Apply confidence threshold (Facebook uses value threshold, not percentile)
-#     conf_mask = world_points_conf >= conf_threshold
-
-#     # Apply color masks if requested
-#     if mask_black_bg:
-#         black_bg_mask = colors_rgb.sum(axis=-1) >= 16
-#         conf_mask = conf_mask & black_bg_mask
-
-#     if mask_white_bg:
-#         white_bg_mask = ~(
-#             (colors_rgb[..., 0] > 240) &
-#             (colors_rgb[..., 1] > 240) &
-#             (colors_rgb[..., 2] > 240)
-#         )
-#         conf_mask = conf_mask & white_bg_mask
-
-#     # Apply stride (subsample points)
-#     if stride > 1:
-#         stride_mask = np.zeros((H, W), dtype=bool)
-#         stride_mask[::stride, ::stride] = True
-#         stride_mask = np.broadcast_to(stride_mask[np.newaxis, :, :], (S, H, W))
-#         conf_mask = conf_mask & stride_mask
-
-#     if verbose:
-#         CONSOLE.print(f"  - Points after confidence & mask filtering: {np.sum(conf_mask):,}")
-
-#     # Limit to max 100k points (using Facebook's function directly)
-#     conf_mask = randomly_limit_trues(conf_mask, 100000)
-
-#     if verbose:
-#         CONSOLE.print(f"  - Points after random limiting (max 100k): {np.sum(conf_mask):,}")
-
-#     # Filter points
-#     points3d = world_points[conf_mask]
-#     points_xyf = points_xyf[conf_mask]
-#     points_rgb = colors_rgb[conf_mask]
-
-#     if verbose:
-#         CONSOLE.print(f"[bold green]✓ Filtered to {len(points3d):,} points")
-
-#     return points3d, points_xyf, points_rgb
-
-
-
-def _hash_point(point: np.ndarray, scale: float = 100) -> int:
-    """Create a hash for a 3D point by quantizing coordinates.
-
-    This is used to merge nearby 3D points that are effectively the same point
-    observed from multiple views. The scale parameter controls the precision
-    of the quantization (higher = finer precision).
-
-    Args:
-        point: 3D point coordinates (3,)
-        scale: Quantization scale factor (default: 100)
-
-    Returns:
-        Hash value for the quantized point
-    """
-    quantized = tuple(np.round(point * scale).astype(int))
-    return hash(quantized)
-
-
 def _run_global_alignment(
     images: torch.Tensor,
     image_paths: List[Path],
@@ -1440,6 +1534,8 @@ def _run_global_alignment(
     max_query_pts: int = 4096,
     shared_camera: bool = False,
     verbose: bool = False,
+    depth_map: Optional[np.ndarray] = None,
+    lambda_depth: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """Run Global Alignment to refine camera poses using feature matching.
 
@@ -1492,14 +1588,16 @@ def _run_global_alignment(
         CONSOLE.print(f"  - Optimizing camera poses...")
     
     extrinsic_refined, intrinsic_refined = pose_optimization(
-        match_outputs=match_outputs, 
-        extrinsic=extrinsic, 
-        intrinsic=intrinsic, 
-        images=images, 
-        depth_conf=depth_conf, 
+        match_outputs=match_outputs,
+        extrinsic=extrinsic,
+        intrinsic=intrinsic,
+        images=images,
+        depth_conf=depth_conf,
         base_image_path_list=image_basenames,
-        target_scene_dir=colmap_dir, 
+        target_scene_dir=colmap_dir,
         shared_intrinsics=shared_camera,
+        depth_maps=depth_map,
+        lambda_depth=lambda_depth,
     )
 
     # pose_optimization already returns numpy arrays, no conversion needed
@@ -1558,6 +1656,174 @@ def adjust_learning_rate_by_lr(optimizer, lr):
             param_group["lr"] = lr * param_group["lr_scale"]
         else:
             param_group["lr"] = lr
+
+def unproject_points(points_2d, depth, K, cam2w):
+    """
+    Unproject 2D image points with depth to 3D world coordinates.
+
+    Args:
+        points_2d: (N, 2) tensor of (x, y) image coordinates
+        depth: (N, 1) tensor of depth values
+        K: (4, 4) intrinsic matrix
+        cam2w: (4, 4) camera-to-world extrinsic matrix
+
+    Returns:
+        points_3d: (N, 3) tensor of 3D world coordinates
+    """
+    # Extract intrinsic parameters
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    # Unproject to camera coordinates
+    x_cam = (points_2d[:, 0] - cx) * depth.squeeze(-1) / fx
+    y_cam = (points_2d[:, 1] - cy) * depth.squeeze(-1) / fy
+    z_cam = depth.squeeze(-1)
+
+    # Stack to homogeneous coordinates
+    points_cam = torch.stack([x_cam, y_cam, z_cam, torch.ones_like(z_cam)], dim=-1)  # (N, 4)
+
+    # Transform to world coordinates
+    points_world = (cam2w @ points_cam.T).T  # (N, 4)
+
+    return points_world[:, :3]
+
+def project_to_depth(points_3d, K, w2cam):
+    """
+    Project 3D world points to depth values in camera view.
+
+    Args:
+        points_3d: (N, 3) tensor of 3D world coordinates
+        K: (4, 4) intrinsic matrix
+        w2cam: (4, 4) world-to-camera extrinsic matrix
+
+    Returns:
+        depth: (N, 1) tensor of depth values
+    """
+    # Convert to homogeneous coordinates
+    points_3d_hom = torch.cat([points_3d, torch.ones_like(points_3d[:, :1])], dim=-1)  # (N, 4)
+
+    # Transform to camera coordinates
+    points_cam = (w2cam @ points_3d_hom.T).T  # (N, 4)
+
+    # Return depth (z-coordinate in camera space)
+    return points_cam[:, 2:3]
+
+def compute_depth_consistency_loss(
+    corr_points_i: torch.Tensor,
+    corr_points_j: torch.Tensor,
+    depth_maps_tensor: torch.Tensor,
+    indexes_i: list,
+    indexes_j: list,
+    Ks_i: torch.Tensor,
+    Ks_j: torch.Tensor,
+    cam2w_i: torch.Tensor,
+    cam2w_j: torch.Tensor,
+    w2cam_j: torch.Tensor,
+    imsizes: torch.Tensor,
+    corr_weight_valid: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute depth consistency loss for feature correspondences.
+
+    This function validates correspondences by checking if 3D points unprojected
+    from view i project to consistent depths in view j.
+
+    Args:
+        corr_points_i: (P, N, 2) correspondence points in view i (batched by pairs)
+        corr_points_j: (P, N, 2) correspondence points in view j (batched by pairs)
+        depth_maps_tensor: (num_images, H, W) depth maps for all images
+        indexes_i: List of image indices for view i (length P)
+        indexes_j: List of image indices for view j (length P)
+        Ks_i: (P, 4, 4) intrinsic matrices for view i
+        Ks_j: (P, 4, 4) intrinsic matrices for view j
+        cam2w_i: (P, 4, 4) camera-to-world transforms for view i
+        cam2w_j: (P, 4, 4) camera-to-world transforms for view j
+        w2cam_j: (P, 4, 4) world-to-camera transforms for view j
+        imsizes: (2,) tensor of [width, height]
+        corr_weight_valid: (P, N, 1) correspondence weights (batched by pairs)
+
+    Returns:
+        Depth consistency loss (scalar tensor)
+    """
+    P, N = corr_points_i.shape[:2]  # P = num pairs, N = max matches per pair
+
+    # Normalize correspondence points to [-1, 1] for grid_sample
+    grid_i = corr_points_i / imsizes * 2 - 1  # (P, N, 2)
+    grid_j = corr_points_j / imsizes * 2 - 1  # (P, N, 2)
+
+    all_depth_errors = []
+    all_weights = []
+
+    # Process each image pair
+    for pair_idx, (img_idx_i, img_idx_j) in enumerate(zip(indexes_i, indexes_j)):
+        # Get depth maps for this image pair
+        # Handle both (num_images, H, W) and (num_images, 1, H, W) shapes
+        depth_i = depth_maps_tensor[img_idx_i]
+        depth_j = depth_maps_tensor[img_idx_j]
+
+        # Ensure we have (1, 1, H, W) shape for grid_sample
+        if depth_i.dim() == 2:  # (H, W)
+            depth_i_map = depth_i.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        elif depth_i.dim() == 3:  # (1, H, W)
+            depth_i_map = depth_i.unsqueeze(0)  # (1, 1, H, W)
+        else:
+            depth_i_map = depth_i
+
+        if depth_j.dim() == 2:  # (H, W)
+            depth_j_map = depth_j.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        elif depth_j.dim() == 3:  # (1, H, W)
+            depth_j_map = depth_j.unsqueeze(0)  # (1, 1, H, W)
+        else:
+            depth_j_map = depth_j
+
+        # Get correspondences for this pair
+        grid_i_pair = grid_i[pair_idx]  # (N, 2)
+        grid_j_pair = grid_j[pair_idx]  # (N, 2)
+        corr_pts_i_pair = corr_points_i[pair_idx]  # (N, 2)
+        weights_pair = corr_weight_valid[pair_idx]  # (N, 1)
+
+        # Sample depths at all correspondence locations for this pair
+        # grid_sample expects (B, H, W, 2) format for grid
+        sample_i = torch.nn.functional.grid_sample(
+            depth_i_map,
+            grid_i_pair.view(1, N, 1, 2),  # (1, N, 1, 2)
+            align_corners=True,
+            mode='bilinear'
+        ).squeeze()  # (N,)
+
+        sample_j = torch.nn.functional.grid_sample(
+            depth_j_map,
+            grid_j_pair.view(1, N, 1, 2),  # (1, N, 1, 2)
+            align_corners=True,
+            mode='bilinear'
+        ).squeeze()  # (N,)
+
+        # Get camera parameters for this pair
+        K_i = Ks_i[pair_idx]  # (4, 4)
+        K_j = Ks_j[pair_idx]  # (4, 4)
+        c2w_i = cam2w_i[pair_idx]  # (4, 4)
+        w2c_j = w2cam_j[pair_idx]  # (4, 4)
+
+        # Unproject all points from view i to 3D
+        pts_3d = unproject_points(corr_pts_i_pair, sample_i.unsqueeze(-1), K_i, c2w_i)  # (N, 3)
+
+        # Project all 3D points to depth in view j
+        projected_depths = project_to_depth(pts_3d, K_j, w2c_j)  # (N, 1)
+
+        # Compute depth consistency error for this pair
+        depth_errors = torch.abs(projected_depths.squeeze(-1) - sample_j)  # (N,)
+
+        all_depth_errors.append(depth_errors)
+        all_weights.append(weights_pair.squeeze(-1))
+
+    # Concatenate all errors and weights
+    all_depth_errors = torch.cat(all_depth_errors)  # (P*N,)
+    all_weights = torch.cat(all_weights)  # (P*N,)
+
+    # Compute weighted mean depth consistency loss
+    depth_consistency_loss = (all_depth_errors * all_weights).sum() / (all_weights.sum() + 1e-8)
+
+    return depth_consistency_loss
 
 def l1_loss(x, y):
     return torch.linalg.norm(x - y, dim=-1)
@@ -1637,6 +1903,48 @@ def extract_matches(
     batch_size: int = 128,
     err_range: float = 20,
 ) -> Dict[str, Any]:
+    """
+    Returns:
+        output_dict: Dictionary containing the following keys:
+            - corr_points_i: torch.Tensor of shape (P, N, 2)
+                # 2D keypoint coordinates in image i (first image of each pair)
+                # shape: (P, N, 2) where
+                #   P: number of image pairs,
+                #   N: maximum number of matches across all pairs (zero-padded)
+                #   2: (x, y) pixel coordinates (pixels, top-left origin)
+                # corr_points_i[p, k] = 11th matched keypoint in 6th pair, i-th image
+
+            - corr_points_j: torch.Tensor of shape (P, N, 2)
+                # 2D keypoint coordinates in image j (second image of each pair)
+                # Same structure as corr_points_i
+                # corr_points_j[p, k] matches corr_points_i[p, k]
+
+            - corr_weights: torch.Tensor of shape (P, N, 1)
+                # Confidence weight for each correspondence, normalized (mean ≈ 1)
+                # Range: 0 (out of frame) to >1 (high consistency)
+                # Used to down-weight outliers during optimization
+
+            - image_names_i: np.ndarray of shape (P,), dtype=string
+                # Filenames or paths of first image in each pair
+
+            - image_names_j: np.ndarray of shape (P,), dtype=string
+                # Filenames or paths of second image in each pair
+
+            - num_matches: List[int], length P
+                # Number of valid (non-zero-padded) matches for each image pair
+                # Use corr_points_i[p, :num_matches[p]] for valid matches in pair p
+
+            - epipolar_err: float
+                # Median symmetrical epipolar error over all correspondences (pixels)
+
+            - indexes_i_expanded: np.ndarray of shape (M,), dtype=int64
+                # Camera indices for image i, for every match (expanded/repeated per match)
+                # M = sum(num_matches)
+
+            - indexes_j_expanded: np.ndarray of shape (M,), dtype=int64
+                # Camera indices for image j, for every match (expanded/repeated per match)
+                # M = sum(num_matches)
+    """
 
     xfeat = torch.hub.load('verlab/accelerated_features', 'XFeat', pretrained=True, top_k=max_query_pts)
 
@@ -1751,25 +2059,29 @@ def extract_matches(
         "image_names_i": image_names_i_batched,
         "image_names_j": image_names_j_batched,
         "num_matches": num_matches,
-        "epipolar_err": err.median().item()
+        "epipolar_err": err.median().item(),
+        "indexes_i_expanded": indexes_i_expanded,
+        "indexes_j_expanded": indexes_j_expanded,
     }
 
     return output_dict
 
 def pose_optimization(
-    match_outputs: Dict[str, Any], 
-    extrinsic: np.ndarray, 
-    intrinsic: np.ndarray, 
-    images: torch.Tensor, 
-    depth_conf: np.ndarray, 
-    base_image_path_list: List[str], 
+    match_outputs: Dict[str, Any],
+    extrinsic: np.ndarray,
+    intrinsic: np.ndarray,
+    images: torch.Tensor,
+    depth_conf: np.ndarray,
+    base_image_path_list: List[str],
     target_scene_dir: Optional[str],
     device: str = 'cuda',
     lr_base: Optional[float] = None,
     lr_end: Optional[float] = None,
     lambda_epi: float = 1.0,
+    lambda_depth: float = 0.0,
     niter: int = 300,
     shared_intrinsics: bool = True,
+    depth_maps: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     
     torch.cuda.empty_cache()
@@ -1809,7 +2121,13 @@ def pose_optimization(
         indexes_i = [base_image_path_list.index(img_name) for img_name in match_outputs["image_names_i"]]
         indexes_j = [base_image_path_list.index(img_name) for img_name in match_outputs["image_names_j"]]
         imsizes = imsizes.to(corr_points_i.device)
-        
+
+        # Prepare depth maps if depth consistency is enabled
+        if depth_maps is not None and lambda_depth > 0:
+            depth_maps_tensor = torch.from_numpy(depth_maps).float()
+        else:
+            depth_maps_tensor = None
+
     qvec = qvec.to(device)
     tvec = tvec.to(device)
     log_sizes = log_sizes.to(device)
@@ -1824,6 +2142,9 @@ def pose_optimization(
     corr_weight_valid = corr_weights.to(device)
     corr_weight_valid = corr_weight_valid**(0.5)
     corr_weight_valid /= corr_weight_valid.mean()
+
+    if depth_maps_tensor is not None:
+        depth_maps_tensor = depth_maps_tensor.to(device)
 
     params = [{
         "params": [
@@ -1857,12 +2178,34 @@ def pose_optimization(
 
         loss = 0.0
 
-        # batchify the computation to avoid OOM
+        # Epipolar geometry loss
         P_i = Ks_i @ w2cam_i
         P_j = Ks_j @ w2cam_j
         Fm = kornia.geometry.epipolar.fundamental_from_projections(P_i[:, :3], P_j[:, :3])
         err = kornia.geometry.symmetrical_epipolar_distance(corr_points_i, corr_points_j, Fm, squared=False, eps=1e-08)
         loss = (err * corr_weight_valid.squeeze(-1)).mean() * lambda_epi
+
+        # Depth consistency loss (optional)
+        if depth_maps_tensor is not None and lambda_depth > 0:
+            cam2w_i = cam2w[indexes_i]
+            cam2w_j = cam2w[indexes_j]
+
+            depth_consistency_loss = compute_depth_consistency_loss(
+                corr_points_i=corr_points_i,
+                corr_points_j=corr_points_j,
+                depth_maps_tensor=depth_maps_tensor,
+                indexes_i=indexes_i,
+                indexes_j=indexes_j,
+                Ks_i=Ks_i,
+                Ks_j=Ks_j,
+                cam2w_i=cam2w_i,
+                cam2w_j=cam2w_j,
+                w2cam_j=w2cam_j,
+                imsizes=imsizes,
+                corr_weight_valid=corr_weight_valid,
+            )
+
+            loss += lambda_depth * depth_consistency_loss
 
         loss_list.append(loss.item())
 
