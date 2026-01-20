@@ -52,6 +52,7 @@ import struct
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import time
 
 import cv2
 import numpy as np
@@ -65,6 +66,19 @@ import kornia
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for headless servers
 import matplotlib.pyplot as plt
+
+try:
+    from streamvggt.models.streamvggt import StreamVGGT
+    from streamvggt.utils.load_fn import load_and_preprocess_images
+    from streamvggt.utils.pose_enc import pose_encoding_to_extri_intri
+    from streamvggt.utils.geometry import FrameDiskCache   
+    _HAS_INFINITE_VGGT = True
+except ImportError:
+    _HAS_INFINITE_VGGT = False
+    # StreamVGGT = None  # type: ignore
+    # load_and_preprocess_images = None  # type: ignore
+    # pose_encoding_to_extri_intri = None  # type: ignore
+    # FrameDiskCache = None  # type: ignore
 
 # Try to import vggt - it's an optional dependency
 try:
@@ -87,7 +101,6 @@ except ImportError:
 from nerfstudio.process_data.process_data_utils import CameraModel
 from nerfstudio.utils.rich_utils import CONSOLE
 
-
 def is_vggt_available() -> bool:
     """Check if VGGT is installed and available.
 
@@ -95,7 +108,6 @@ def is_vggt_available() -> bool:
         True if VGGT is available, False otherwise.
     """
     return _HAS_VGGT
-
 
 def run_vggt(
     image_dir: Path,
@@ -111,6 +123,7 @@ def run_vggt(
     use_global_alignment: bool = True,
     filter_outlier_cameras: bool = False,
     lambda_depth: float = 0.0,
+    overwrite: bool = False,
 ) -> None:
     """Runs VGGT on images to estimate camera poses and depth (Facebook's feedforward mode).
 
@@ -147,7 +160,7 @@ def run_vggt(
     vggt_ckpt_path = colmap_dir / "vggt_checkpoint.pt"
 
     # Run VGGT inference
-    if vggt_ckpt_path.exists():
+    if vggt_ckpt_path.exists() and not overwrite:
         vggt_data = torch.load(vggt_ckpt_path)
     else:
         vggt_data = _run_vggt_inference(
@@ -300,7 +313,217 @@ def run_vggt(
         CONSOLE.print(f"  - Cameras: {len(reconstruction.cameras)}")
         CONSOLE.print(f"  - Images: {len(reconstruction.images)}")
         CONSOLE.print(f"  - 3D points: {len(reconstruction.points3D)}")
-        
+
+
+def run_infinite_vggt(
+    image_dir: Path,
+    colmap_dir: Path,
+    camera_model: str = "SIMPLE_PINHOLE",
+    verbose: bool = False,
+    conf_threshold: float = 50.0,
+    model_name: str = "lch01/StreamVGGT",
+    total_budget: int = 1200000,
+    cache_results: bool = True,
+    scale_factor: float = 1.0,
+    shared_camera: bool = True,
+    max_points_for_colmap: int = 500000,
+    use_global_alignment: bool = True,
+    filter_outlier_cameras: bool = False,
+    lambda_depth: float = 0.0,
+    overwrite: bool = False,
+) -> None:
+    """Runs InfiniteVGGT on images to estimate camera poses and depth (streaming/memory-efficient mode).
+
+    This follows the same pattern as run_vggt but uses InfiniteVGGT/StreamVGGT for more
+    memory-efficient processing:
+    InfiniteVGGT inference → depth unprojection → filter points → batch_np_matrix_to_pycolmap_wo_track()
+
+    Args:
+        image_dir: Path to the directory containing the images.
+        colmap_dir: Path to the output directory.
+        camera_model: Camera model to use (not used by InfiniteVGGT, kept for compatibility).
+        verbose: If True, logs the output.
+        conf_threshold: Confidence threshold (0-100%) for including points.
+        model_name: HuggingFace model name for InfiniteVGGT (default: "lch01/StreamVGGT").
+        total_budget: Total budget for memory efficiency in InfiniteVGGT.
+        cache_results: If True, cache intermediate results for faster re-runs.
+        scale_factor: Scale factor for 3D points and camera positions.
+        shared_camera: If True, use single camera model for all frames.
+        max_points_for_colmap: Maximum number of points to include in COLMAP reconstruction.
+        use_global_alignment: If True, perform global alignment to refine poses.
+        filter_outlier_cameras: If True, filter outlier cameras after reconstruction (requires use_global_alignment=True).
+        lambda_depth: Weight for depth consistency term in global alignment.
+    """
+    if not is_infinite_vggt_available():
+        CONSOLE.print(
+            "[bold red]Error: To use InfiniteVGGT sfm_tool, you must install InfiniteVGGT!\n"
+            "Please install InfiniteVGGT from: https://github.com/Linketic/InfiniteVGGT.git"
+            "Example: pip install git+https://github.com/Linketic/InfiniteVGGT.git"
+        )
+        sys.exit(1)
+
+    # Create output directory
+    output_dir = colmap_dir / "sparse" / "0"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    infinite_vggt_ckpt_path = colmap_dir / "infinite_vggt_checkpoint.pt"
+
+    # Run InfiniteVGGT inference
+    if infinite_vggt_ckpt_path.exists() and not overwrite:
+        infinite_vggt_data = torch.load(infinite_vggt_ckpt_path)
+    else:
+        infinite_vggt_data = _run_infinite_vggt_inference(
+            image_dir=image_dir,
+            model_name=model_name,
+            total_budget=total_budget,
+            cache_results=cache_results,
+            verbose=verbose,
+        )
+
+        torch.save(infinite_vggt_data, infinite_vggt_ckpt_path)
+
+        if verbose:
+            CONSOLE.print(f"[bold green]✓ Saved InfiniteVGGT checkpoint to {infinite_vggt_ckpt_path}")
+            CONSOLE.print(f"  Use this checkpoint for rapid testing of match extraction!")
+            CONSOLE.print(f"  Example: python test_ransac_filtering.py --checkpoint {infinite_vggt_ckpt_path}")
+
+
+    # Extract data from inference results
+    images = infinite_vggt_data["images"]
+    extrinsic = infinite_vggt_data["extrinsic"]
+    intrinsic = infinite_vggt_data["instrinsics"] # Upsampled to native resolution
+    intrinsic_downsampled = infinite_vggt_data["instrinsics_downsampled"] # Downsampled to InfiniteVGGT resolution
+    original_coords = infinite_vggt_data["original_coords"] # [0, 0, new_width, new_height, width, height]
+    depth_map = infinite_vggt_data["depth"]
+    depth_conf = infinite_vggt_data["depth_conf"]
+    image_paths = infinite_vggt_data["image_paths"]
+
+    # Use global alignment if enabled
+    if use_global_alignment:
+        # Optimized camera poses using feature matching
+        extrinsic, intrinsic_downsampled, match_outputs = _run_global_alignment(
+            images=images,
+            image_paths=image_paths,
+            extrinsic=extrinsic,
+            intrinsic=intrinsic_downsampled,
+            depth_map=depth_map,
+            depth_conf=depth_conf,
+            lambda_depth=lambda_depth,
+            colmap_dir=colmap_dir,
+            shared_camera=shared_camera,
+            verbose=verbose,
+        )
+    else:
+        match_outputs = None
+
+    # Filter and prepare 3D points in Facebook's format (points3d, points_xyf, points_rgb)
+    # Note: Facebook uses conf_threshold as a value (e.g., 5.0), not percentile
+    # For compatibility, we convert percentile to value if > 1
+    if conf_threshold > 1.0:
+        # Interpret as percentile and convert to value
+        conf_threshold_value = np.percentile(depth_conf, conf_threshold)
+    else:
+        # Interpret as value directly
+        conf_threshold_value = conf_threshold
+
+    if verbose:
+        CONSOLE.print(f"  - Using confidence threshold: {conf_threshold_value:.4f}")
+
+    # Scale points for better reconstruction --> taken from VGGT-X demo_colmap.py
+    extrinsic[:, :3, 3] *= scale_factor
+    depth_map *= scale_factor
+
+    # Unproject depth map to point map
+    points3d = unproject_depth_map_to_point_map(
+        depth_map,
+        extrinsic,
+        intrinsic_downsampled
+    )
+
+    # Filter points for pycolmap reconstruction using VGGTX logic
+    points3d, points_xyf, points_rgb = _filter_and_prepare_points_for_pycolmap(
+        points3d=points3d,
+        depth_map=depth_map,
+        depth_conf=depth_conf,
+        images=images,
+        image_paths=image_paths,
+        conf_thres_value=conf_threshold_value,
+        use_global_alignment=use_global_alignment,
+        max_points_for_colmap=max_points_for_colmap,
+        match_outputs=match_outputs
+    )
+
+    # Grab image size from depth map (N, H, W) --> make as width and height
+    image_size = np.array([depth_map.shape[2], depth_map.shape[1]])
+
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Building pycolmap reconstruction at WxH ({image_size[0]}x{image_size[1]})...")
+
+    # Step 1: Build reconstruction at model resolution using intrinsic_downsampled
+    # within batch_np_matrix_to_pycolmap_wo_track image_size is used as width = image_size[0] and height = image_size[1]
+
+    reconstruction = _build_pycolmap_reconstruction_without_tracks(
+        points3d=points3d,
+        points_xyf=points_xyf,
+        points_rgb=points_rgb,
+        extrinsic=extrinsic,
+        intrinsic=intrinsic_downsampled,
+        image_paths=image_paths,
+        image_size=image_size, # [W, H]
+        shared_camera=shared_camera,
+        camera_type=camera_model,
+        verbose=verbose,
+    )
+
+    if reconstruction is None:
+        CONSOLE.print("[bold red]Error: Failed to build pycolmap reconstruction!")
+        sys.exit(1)
+
+    # Step 2: Rescale reconstruction to original dimensions
+    reconstruction_resolution = (image_size[0], image_size[1]) # Reverse as it expects width and height
+
+    reconstruction = _rescale_reconstruction_to_original_dimensions(
+        reconstruction=reconstruction,
+        image_paths=image_paths,
+        original_image_sizes=original_coords,
+        image_size=reconstruction_resolution,
+        shift_point2d_to_original_res=True,
+        shared_camera=shared_camera,
+        verbose=verbose,
+    )
+
+    # Step 3: Filter outlier cameras (if enabled)
+    if use_global_alignment and filter_outlier_cameras:
+        if verbose:
+            CONSOLE.print(f"[bold yellow]Filtering outlier cameras...")
+
+        reconstruction, removed_ids = _filter_outlier_cameras(
+            reconstruction=reconstruction,
+            match_outputs=match_outputs,
+            depth_conf=depth_conf,
+            pose_distance_std_factor=2.0,
+            min_matches=200,
+            min_points_3d=250,
+            verbose=verbose,
+        )
+
+        if len(removed_ids) > 0:
+            CONSOLE.print(f"[bold yellow]Filtered {len(removed_ids)} outlier cameras from reconstruction")
+            if verbose:
+                CONSOLE.print(f"  - Removed image IDs: {removed_ids}")
+
+    # Write reconstruction to binary format
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Writing COLMAP files to {output_dir}")
+
+    reconstruction.write_binary(str(output_dir))
+
+    if verbose:
+        CONSOLE.print(f"[bold green]✓ COLMAP reconstruction complete!")
+        CONSOLE.print(f"  - Cameras: {len(reconstruction.cameras)}")
+        CONSOLE.print(f"  - Images: {len(reconstruction.images)}")
+        CONSOLE.print(f"  - 3D points: {len(reconstruction.points3D)}")
+
+
 # def run_vggt_ba(
 #     image_dir: Path,
 #     colmap_dir: Path,
@@ -894,6 +1117,183 @@ def _run_vggt_inference(
 
 
 
+def is_infinite_vggt_available() -> bool:
+    """Check if InfiniteVGGT is installed and available.
+
+    Returns:
+        True if InfiniteVGGT is available, False otherwise.
+    """
+    return _HAS_INFINITE_VGGT
+
+
+def _run_infinite_vggt_inference(
+    image_dir: Path,
+    model_name: str = "lch01/StreamVGGT",
+    total_budget: int = 1200000,
+    cache_results: bool = True,
+    verbose: bool = False,
+):
+
+    if not is_infinite_vggt_available():
+        CONSOLE.print(
+            "[bold red]Error: To use InfiniteVGGT, you must install it!\n"
+            "Please install InfiniteVGGT from: https://github.com/Linketic/InfiniteVGGT.git"
+            "Example: pip install git+https://github.com/Linketic/InfiniteVGGT.git"
+        )
+        sys.exit(1)
+
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+    if verbose:
+        CONSOLE.print(f"[bold green]Using device: {device}")
+        CONSOLE.print(f"[bold yellow]Using dtype: {dtype}")
+
+    # Load VGGT model
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Loading InfiniteVGGT model: {model_name}")
+        CONSOLE.print(f"[bold yellow]  - Using total_budget={total_budget} for memory efficiency")
+
+    # VGGT-X: Use smaller chunk_size for better memory efficiency
+    model = StreamVGGT.from_pretrained(model_name, total_budget=total_budget)
+    model.eval()
+    model = model.to(device)  # Move model to device (keep original dtype for LayerNorm compatibility)
+
+    # --------------------------------------------------------------------------
+    # Image Loading and Preprocessing Section
+    # --------------------------------------------------------------------------
+
+    # Find all image files in the directory (sorted by filename)
+    image_paths = sorted([
+        p for p in image_dir.iterdir()
+        if p.suffix.lower() in ['.png', '.jpg', '.jpeg']
+    ])
+
+    if len(image_paths) == 0:
+        CONSOLE.print(f"[bold red]Error: No images found in {image_dir}")
+        sys.exit(1)
+
+    if verbose:
+        CONSOLE.print(f"[bold green]Found {len(image_paths)} images")
+
+    # Prepare original images as RGB numpy arrays for later use
+    original_images = []
+    for img_path in image_paths:
+        img = Image.open(img_path).convert('RGB')
+        original_images.append(np.array(img))
+
+    # Prepare paths as strings for VGGT preprocessing
+    image_names = [str(p) for p in image_paths]
+
+    # Load and preprocess images for InfiniteVGGT:
+    #   - Keep aspect ratio;
+    #   - Scale largest dimension to img_load_resolution;
+    # Also outputs original (float pixel) coordinates for each processed image
+    img_load_resolution = 518
+    print(f"Loading {len(image_paths)} images...")
+    images, original_coords = load_and_preprocess_images_ratio(image_names, img_load_resolution)
+    print(f"✓ Images preprocessed: {images.shape}")
+    print(f"  Shape: (N={images.shape[0]}, C={images.shape[1]}, H={images.shape[2]}, W={images.shape[3]})")
+
+    # Move tensors to device (keep Float32, autocast will handle dtype conversion)
+    # Images are (B, 3, H, W)
+    images = images.to(device)
+    original_coords = original_coords.to(device)
+
+    # Extract width and height as Python integers (for pose_encoding_to_extri_intri)
+    width = int(original_coords[0, -2].item())
+    height = int(original_coords[0, -1].item())
+
+    # Save processed image shape (HxW) for later pose decoding and debug info
+    image_shape = images.shape[-2:]
+
+    # Prepare frames for inference
+    frames = [{"img": images[i].unsqueeze(0)} for i in range(images.shape[0])]
+
+    if verbose:
+        CONSOLE.print(f"[bold yellow]Running VGGT inference...")
+        CONSOLE.print(f"  - Images shape: {images.shape}, dtype: {images.dtype}")
+        CONSOLE.print(f"  - Model dtype: {next(model.parameters()).dtype}")
+    
+     # --------------------------------------------------------------------------
+    # Run inference (no autocast needed since everything already in correct dtype)
+    # Track timing and memory tracking
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+    start_time = time.time()
+
+    with torch.no_grad():
+        with torch.cuda.amp.autocast(dtype=dtype):
+            predictions = model.inference(
+                frames,
+                frame_writer=None,
+                cache_results=cache_results
+            )
+
+        # Create matched dictionary of predictions to VGGTX
+        predictions = {
+            "points3d": [res['pts3d_in_other_view'].squeeze(0) for res in predictions.ress],
+            "points_conf": [res['conf'].squeeze(0) for res in predictions.ress],
+            "depth_map": [res['depth'].squeeze(0) for res in predictions.ress],
+            "depth_conf": [res['depth_conf'].squeeze(0) for res in predictions.ress],
+            "pose_enc": [res['camera_pose'].squeeze(0) for res in predictions.ress]
+        }
+
+        # Stack tensors and move to CPU (keep as tensors for pose_encoding_to_extri_intri)
+        predictions = {k: torch.stack(v, dim=0).detach().cpu().float() for k, v in predictions.items()}
+
+        # Get extrinsics and intrinsics (at resolution of processing images)
+        # pose_encoding_to_extri_intri expects (B, N, 16) with batch dimension
+        extrinsic, intrinsic_downsampled = pose_encoding_to_extri_intri(
+            predictions["pose_enc"].unsqueeze(0),  # Add batch dimension: (N, 16) -> (1, N, 16)
+            image_shape
+        )
+        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+            predictions["pose_enc"].unsqueeze(0),  # Add batch dimension: (N, 16) -> (1, N, 16)
+            [width, height]
+        )
+
+        # Convert to numpy and squeeze batch dimension (matching VGGT format)
+        extrinsic = extrinsic.squeeze(0).cpu().float().numpy()  # (1, N, 4, 4) -> (N, 4, 4)
+        intrinsic = intrinsic.squeeze(0).cpu().float().numpy()  # (1, N, 3, 3) -> (N, 3, 3)
+        intrinsic_downsampled = intrinsic_downsampled.squeeze(0).cpu().float().numpy()  # (1, N, 3, 3) -> (N, 3, 3)
+
+        # Convert predictions to numpy after pose processing
+        predictions = {k: v.numpy() for k, v in predictions.items()}
+
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    inference_time = end_time - start_time
+    peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
+
+    if verbose:
+        CONSOLE.print("\n" + "="*70)
+        CONSOLE.print("[bold green]INFERENCE COMPLETE")
+        CONSOLE.print("[bold green]="*70)
+        CONSOLE.print(f"  Total time: {inference_time:.2f}s")
+        CONSOLE.print(f"  Time per frame: {inference_time / len(image_paths):.3f}s")
+        CONSOLE.print(f"  Peak GPU memory: {peak_memory_gb:.2f} GB")
+        CONSOLE.print(f"  Frames processed: {len(image_paths)}")
+        CONSOLE.print("[bold green]="*70)
+
+    # Return format matching _run_vggt_inference for compatibility
+    return {
+        "images": images,
+        "extrinsic": extrinsic,
+        "instrinsics": intrinsic,  # Note: typo matches _run_vggt_inference
+        "instrinsics_downsampled": intrinsic_downsampled,  # Note: typo matches _run_vggt_inference
+        "depth": predictions["depth_map"],  # Renamed from depth_map to match VGGT
+        "depth_conf": predictions["depth_conf"],
+        "image_paths": image_paths,
+        "original_coords": original_coords.cpu().float().numpy(),
+        # Extra InfiniteVGGT-specific data (not used by standard pipeline but useful)
+        "points3d": predictions["points3d"],
+        "points_conf": predictions["points_conf"],
+    }
+
 # def _build_pycolmap_reconstruction_from_tracks(
 #     points3D: np.ndarray,
 #     extrinsic: np.ndarray,
@@ -1174,13 +1574,14 @@ def _rescale_reconstruction_to_original_dimensions(
         pycamera = reconstruction.cameras[pyimage.camera_id]
         pyimage.name = image_paths[pyimageid - 1].name
 
-        if rescale_camera:
-            pred_params = copy.deepcopy(pycamera.params)
+        pred_params = copy.deepcopy(pycamera.params)
 
-            # Grabs original W / H
-            real_image_size = original_image_sizes[pyimageid - 1, -2:]
-            scale_x = real_image_size[0] / image_size[0]
-            scale_y = real_image_size[1] / image_size[1]
+        # Grabs original W / H
+        real_image_size = original_image_sizes[pyimageid - 1, -2:]
+        scale_x = real_image_size[0] / image_size[0]
+        scale_y = real_image_size[1] / image_size[1]
+
+        if rescale_camera:
 
             # -------------------------------
             # Rescale focal length parameters
@@ -1206,12 +1607,12 @@ def _rescale_reconstruction_to_original_dimensions(
             pred_params[-2] = pred_params[-2] * scale_x
             pred_params[-1] = pred_params[-1] * scale_y
             
-            # -------------------------------
-            # Apply back to camera object
-            # -------------------------------
-            pycamera.params = pred_params
-            pycamera.width = real_image_size[0]
-            pycamera.height = real_image_size[1]
+        # -------------------------------
+        # Apply back to camera object
+        # -------------------------------
+        pycamera.params = pred_params
+        pycamera.width = real_image_size[0]
+        pycamera.height = real_image_size[1]
 
         if shift_point2d_to_original_res:
             # Also shift the point2D to original resolution
@@ -1663,13 +2064,17 @@ def unproject_points(points_2d, depth, K, cam2w):
 
     Args:
         points_2d: (N, 2) tensor of (x, y) image coordinates
-        depth: (N, 1) tensor of depth values
+        depth: (N, 1) or (N,) tensor of depth values
         K: (4, 4) intrinsic matrix
         cam2w: (4, 4) camera-to-world extrinsic matrix
 
     Returns:
         points_3d: (N, 3) tensor of 3D world coordinates
     """
+    # Ensure depth has shape (N, 1)
+    if depth.dim() == 1:
+        depth = depth.unsqueeze(-1)
+
     # Extract intrinsic parameters
     fx, fy = K[0, 0], K[1, 1]
     cx, cy = K[0, 2], K[1, 2]
@@ -1682,8 +2087,8 @@ def unproject_points(points_2d, depth, K, cam2w):
     # Stack to homogeneous coordinates
     points_cam = torch.stack([x_cam, y_cam, z_cam, torch.ones_like(z_cam)], dim=-1)  # (N, 4)
 
-    # Transform to world coordinates
-    points_world = (cam2w @ points_cam.T).T  # (N, 4)
+    # Transform to world coordinates: (4, 4) @ (4, N) -> (4, N) -> (N, 4)
+    points_world = (cam2w @ points_cam.T).T
 
     return points_world[:, :3]
 
@@ -1702,8 +2107,8 @@ def project_to_depth(points_3d, K, w2cam):
     # Convert to homogeneous coordinates
     points_3d_hom = torch.cat([points_3d, torch.ones_like(points_3d[:, :1])], dim=-1)  # (N, 4)
 
-    # Transform to camera coordinates
-    points_cam = (w2cam @ points_3d_hom.T).T  # (N, 4)
+    # Transform to camera coordinates: (4, 4) @ (4, N) -> (4, N) -> (N, 4)
+    points_cam = (w2cam @ points_3d_hom.T).T
 
     # Return depth (z-coordinate in camera space)
     return points_cam[:, 2:3]
@@ -1766,15 +2171,15 @@ def compute_depth_consistency_loss(
             depth_i_map = depth_i.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
         elif depth_i.dim() == 3:  # (1, H, W)
             depth_i_map = depth_i.unsqueeze(0)  # (1, 1, H, W)
-        else:
-            depth_i_map = depth_i
+        else:  # 4D or higher
+            depth_i_map = depth_i.reshape(1, 1, depth_i.shape[-2], depth_i.shape[-1])
 
         if depth_j.dim() == 2:  # (H, W)
             depth_j_map = depth_j.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
         elif depth_j.dim() == 3:  # (1, H, W)
             depth_j_map = depth_j.unsqueeze(0)  # (1, 1, H, W)
-        else:
-            depth_j_map = depth_j
+        else:  # 4D or higher
+            depth_j_map = depth_j.reshape(1, 1, depth_j.shape[-2], depth_j.shape[-1])
 
         # Get correspondences for this pair
         grid_i_pair = grid_i[pair_idx]  # (N, 2)
@@ -1784,19 +2189,22 @@ def compute_depth_consistency_loss(
 
         # Sample depths at all correspondence locations for this pair
         # grid_sample expects (B, H, W, 2) format for grid
+        num_corr = grid_i_pair.shape[0]
+
+        # grid_sample with input (1, 1, H, W) and grid (1, N, 1, 2) outputs (1, 1, N, 1)
         sample_i = torch.nn.functional.grid_sample(
-            depth_i_map,
-            grid_i_pair.view(1, N, 1, 2),  # (1, N, 1, 2)
+            depth_i_map,  # (1, 1, H, W)
+            grid_i_pair.view(1, num_corr, 1, 2),
             align_corners=True,
             mode='bilinear'
-        ).squeeze()  # (N,)
+        )[0, 0, :, 0]  # Extract to get (N,)
 
         sample_j = torch.nn.functional.grid_sample(
-            depth_j_map,
-            grid_j_pair.view(1, N, 1, 2),  # (1, N, 1, 2)
+            depth_j_map,  # (1, 1, H, W)
+            grid_j_pair.view(1, num_corr, 1, 2),
             align_corners=True,
             mode='bilinear'
-        ).squeeze()  # (N,)
+        )[0, 0, :, 0]  # Extract to get (N,)
 
         # Get camera parameters for this pair
         K_i = Ks_i[pair_idx]  # (4, 4)
@@ -2171,10 +2579,14 @@ def pose_optimization(
         adjust_learning_rate_by_lr(optimizer, lr)
         optimizer.zero_grad()
 
-        Ks_i = K[indexes_i]
-        Ks_j = K[indexes_j]
-        w2cam_i = w2cam[indexes_i]
-        w2cam_j = w2cam[indexes_j]
+        # Convert index lists to tensors for proper indexing
+        indexes_i_tensor = torch.tensor(indexes_i, dtype=torch.long, device=K.device)
+        indexes_j_tensor = torch.tensor(indexes_j, dtype=torch.long, device=K.device)
+
+        Ks_i = K[indexes_i_tensor]
+        Ks_j = K[indexes_j_tensor]
+        w2cam_i = w2cam[indexes_i_tensor]
+        w2cam_j = w2cam[indexes_j_tensor]
 
         loss = 0.0
 
@@ -2187,8 +2599,8 @@ def pose_optimization(
 
         # Depth consistency loss (optional)
         if depth_maps_tensor is not None and lambda_depth > 0:
-            cam2w_i = cam2w[indexes_i]
-            cam2w_j = cam2w[indexes_j]
+            cam2w_i = cam2w[indexes_i_tensor]
+            cam2w_j = cam2w[indexes_j_tensor]
 
             depth_consistency_loss = compute_depth_consistency_loss(
                 corr_points_i=corr_points_i,
